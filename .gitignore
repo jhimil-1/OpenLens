@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# PyCharm
+.idea/
+
+# VSCode
+.vscode/
+
+# Model weights
+models/
+*.pth
+*.pt
+
+# Logs
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+
+/venv

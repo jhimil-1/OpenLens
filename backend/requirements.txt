@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic
+torch
+torchvision
+git+https://github.com/openai/CLIP.git
+Pillow
+qdrant-client
+httpx
+python-dotenv
+firecrawl-py
+beautifulsoup4
+lxml
+scikit-learn
