@@ -211,7 +211,7 @@ async def startup_event():
         print(f"[ERROR] Error initializing collection: {e}")
 
 # ────────────────────────────────
-# HELPER FUNCTIONS
+# IMPROVED HELPER FUNCTIONS
 # ────────────────────────────────
 
 def detect_pose(image):
@@ -234,7 +234,6 @@ def detect_pose(image):
             keypoints[name] = (int(lm.x * width), int(lm.y * height))
 
     return keypoints
-
 
 def process_tryon_image(human_img_path: str, garm_img_path: str):
     """Call the Gradio client (Leffa model) to perform virtual try-on."""
@@ -260,137 +259,267 @@ def process_tryon_image(human_img_path: str, garm_img_path: str):
         print(f"[ERROR] Virtual Try-On processing failed: {e}")
         raise
 
-
-def extract_dominant_colors(image: Image.Image, num_colors: int = 3) -> List[str]:
-    """Extract dominant colors from image with aggressive red detection"""
+def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str]:
+    """Extract garment colors using HSV with central focus and background suppression.
+    Designed to avoid picking white/gray backgrounds for items like a blue dress.
+    """
     try:
         image = image.convert("RGB")
-        image = image.resize((100, 100))
-        
-        pixels = np.array(image).reshape(-1, 3)
-        
-        if len(pixels) > 3000:
-            indices = np.random.choice(len(pixels), 3000, replace=False)
-            pixels = pixels[indices]
-        
-        red_pixels = 0
-        total_pixels = len(pixels)
-        
-        for pixel in pixels:
-            r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
-            if r > 120 and g < 100 and b < 100:
-                red_pixels += 1
-        
-        if red_pixels > total_pixels * 0.1:
-            print(f"[COLOR DETECTION] Aggressive red detection: {red_pixels}/{total_pixels} pixels are red-ish")
-            return ["red"]
-        
-        from collections import defaultdict
-        color_groups = []
-        
-        for pixel in pixels:
-            r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
-            r_q = (r // 60) * 60
-            g_q = (g // 60) * 60
-            b_q = (b // 60) * 60
-            
-            found = False
-            for i, (cr, cg, cb, count) in enumerate(color_groups):
-                if abs(r_q - cr) < 80 and abs(g_q - cg) < 80 and abs(b_q - cb) < 80:
-                    color_groups[i] = (
-                        int((cr * count + r) / (count + 1)),
-                        int((cg * count + g) / (count + 1)),
-                        int((cb * count + b) / (count + 1)),
-                        count + 1
-                    )
-                    found = True
-                    break
-            
-            if not found and len(color_groups) < num_colors * 2:
-                color_groups.append((r, g, b, 1))
-        
-        color_groups.sort(key=lambda x: x[3], reverse=True)
-        
-        colors = []
-        for center in color_groups[:num_colors]:
-            r, g, b, count = center
-            confidence = count / total_pixels
-            
-            if confidence > 0.05:
-                color_name = get_color_name(r, g, b)
-                if color_name not in colors:
-                    colors.append(color_name)
-        
+        image = image.resize((128, 128))
+
+        img = np.array(image)
+        h, w, _ = img.shape
+
+        # Central ellipse mask → prioritize the garment region
+        yy, xx = np.ogrid[:h, :w]
+        cy, cx = h / 2.0, w / 2.0
+        ry, rx = h * 0.35, w * 0.35
+        center_mask = (((yy - cy) ** 2) / (ry ** 2) + ((xx - cx) ** 2) / (rx ** 2)) <= 1.0
+
+        # HSV conversion
+        if 'cv2' in globals() and cv2 is not None:
+            hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+            hue_scale = 180.0
+        else:
+            rgb = img.astype(np.float32) / 255.0
+            maxc = rgb.max(axis=2)
+            minc = rgb.min(axis=2)
+            v = maxc
+            s = np.where(v == 0, 0, (maxc - minc) / (v + 1e-6))
+            # approximate OpenCV-like HSV (H unused in fallback; we build from RGB later if needed)
+            hsv = np.stack([np.zeros_like(v), s * 255.0, v * 255.0], axis=2)
+            hue_scale = 180.0
+
+        H = hsv[:, :, 0]
+        S = hsv[:, :, 1] / 255.0
+        V = hsv[:, :, 2] / 255.0
+
+        # First, decide if the central region is predominantly dark or bright
+        center_V = V[center_mask]
+        if center_V.size > 0:
+            dark_ratio = float(np.mean(center_V < 0.18))
+            bright_ratio = float(np.mean(center_V > 0.92))
+            if dark_ratio > 0.55:
+                return ["black"]
+            if bright_ratio > 0.55:
+                return ["white"]
+
+        # Keep well-saturated, mid-value pixels; drop near-white/near-black
+        sat_mask = S > 0.28
+        val_mask = (V > 0.12) & (V < 0.92)
+        keep = center_mask & sat_mask & val_mask
+
+        # If no pixels, relax to whole image with same gates; if still empty, decide by global brightness
+        if not keep.any():
+            keep = sat_mask & val_mask
+        if not keep.any():
+            global_dark = float(np.mean(V < 0.18))
+            global_bright = float(np.mean(V > 0.92))
+            if global_dark > 0.55:
+                return ["black"]
+            if global_bright > 0.55:
+                return ["white"]
+            return ["multi-color"]
+
+        # Estimate border average color and drop pixels close to it (likely background)
+        border = np.concatenate([img[0, :, :], img[-1, :, :], img[:, 0, :], img[:, -1, :]], axis=0)
+        bg_mean = border.mean(axis=0)
+        dist_bg = np.sqrt(((img - bg_mean) ** 2).sum(axis=2))
+        keep = keep & (dist_bg > 35.0)
+
+        if not keep.any():
+            return ["multi-color"]
+
+        hue = H[keep]
+        # Histogram over hue to find dominant hues
+        bins = np.linspace(0, hue_scale, 13, endpoint=True)
+        hist, edges = np.histogram(hue, bins=bins)
+        order = np.argsort(hist)[::-1]
+
+        def hue_to_name(hval: float) -> str:
+            # OpenCV hue [0,180]
+            if hval < 10 or hval >= 170:
+                return "red"
+            if hval < 25:
+                return "orange"
+            if hval < 35:
+                return "yellow"
+            if hval < 85:
+                return "green"
+            if hval < 105:
+                return "cyan"
+            if hval < 140:
+                return "blue"
+            return "purple"
+
+        colors: List[str] = []
+        for idx in order[: max(1, num_colors + 1)]:
+            center_h = (edges[idx] + edges[idx + 1]) / 2.0
+            name = hue_to_name(center_h)
+            if name not in colors:
+                colors.append(name)
+            if len(colors) >= num_colors:
+                break
+
+        # Strong red safeguard: if red present make it primary
+        if 'red' in colors and colors[0] != 'red':
+            colors.remove('red')
+            colors.insert(0, 'red')
+
         return colors if colors else ["multi-color"]
     except Exception as e:
         print(f"[WARNING] Color extraction error: {e}")
         return ["multi-color"]
 
 def get_color_name(r: int, g: int, b: int) -> str:
-    """Convert RGB to color name with aggressive red detection"""
+    """Convert RGB to color name with improved detection"""
     brightness = (r + g + b) / 3
     
-    if r > 120 and g < 100 and b < 100:
-        if r > 150 and g < 80 and b < 80:
-            return "red"
-        elif g > 60:
+    # More precise color detection
+    if r > 150 and g < 100 and b < 100 and r > max(g, b) + 50:
+        if g > 80:
             return "orange"
+        elif r > 200 and g < 60 and b < 60:
+            return "red"
         else:
             return "red"
     
-    if brightness < 50:
+    if brightness < 60:
         return "black"
-    if brightness > 200 and abs(r - g) < 30 and abs(g - b) < 30:
+    if brightness > 220 and abs(r - g) < 30 and abs(g - b) < 30:
         return "white"
     
     max_val = max(r, g, b)
+    min_val = min(r, g, b)
     
-    if abs(r - g) < 30 and abs(g - b) < 30 and abs(r - b) < 30:
-        return "gray"
+    # Gray detection
+    if max_val - min_val < 30:
+        if brightness < 150:
+            return "gray"
+        else:
+            return "white"
     
-    if r > g + 30 and r > b + 30:
-        if g > b + 20:
+    # Primary colors with better thresholds
+    if r > g + 40 and r > b + 40:
+        if g > b + 30:
             return "orange"
-        return "red"
-    elif g > r + 30 and g > b + 30:
-        return "green"
-    elif b > r + 30 and b > g + 30:
-        if b > 180 and r > 100:
+        elif r > 180:
+            return "red"
+        else:
+            return "red"
+    elif g > r + 40 and g > b + 40:
+        if g > 150:
+            return "green"
+        else:
+            return "dark green"
+    elif b > r + 40 and b > g + 40:
+        if b > 150 and r > 100:
             return "purple"
-        return "blue"
-    elif r > 100 and g > 100 and b < 100:
+        elif b > 150:
+            return "blue"
+        else:
+            return "dark blue"
+    elif r > 150 and g > 150 and b < 100:
         return "yellow"
-    elif r > 100 and b > 100:
-        return "pink" if brightness > 150 else "purple"
-    elif g > 100 and b > 100:
-        return "cyan"
-    elif r > 80 and g > 60 and b < 70:
+    elif r > 150 and b > 150 and g < 100:
+        return "purple"
+    elif g > 150 and b > 150 and r < 100:
+        return "teal"
+    elif r > 120 and g > 80 and b < 80:
         return "brown"
-    
-    if r > 100 and g < 90 and b < 90:
-        return "red"
     
     return "multi-color"
 
+def detect_gender_from_category(primary_category: str, all_categories: List[tuple]) -> str:
+    """Detect gender from category names with improved logic"""
+    male_indicators = ["men's", "men", "male", "boy's", "boy", "gentleman", "gents"]
+    female_indicators = ["women's", "women", "female", "girl's", "girl", "lady", "ladies", "woman's", "feminine"]
+    
+    primary_lower = primary_category.lower()
+    
+    # Strong female indicators in primary category
+    for indicator in female_indicators:
+        if indicator in primary_lower:
+            return "women"
+    
+    # Strong male indicators in primary category
+    for indicator in male_indicators:
+        if indicator in primary_lower:
+            return "men"
+    
+    # Check all detected categories with confidence scores
+    male_score = 0
+    female_score = 0
+    
+    for category, score in all_categories:
+        category_lower = category.lower()
+        
+        for indicator in male_indicators:
+            if indicator in category_lower:
+                male_score += score
+        
+        for indicator in female_indicators:
+            if indicator in category_lower:
+                female_score += score
+    
+    print(f"  [GENDER DEBUG] Male score: {male_score:.3f}, Female score: {female_score:.3f}")
+    
+    # Strong gender preference
+    if female_score > 0.4 and male_score == 0:
+        return "women"
+    elif male_score > 0.4 and female_score == 0:
+        return "men"
+    elif female_score > male_score + 0.15:
+        return "women"
+    elif male_score > female_score + 0.15:
+        return "men"
+    
+    # Category-based fallback (strong female indicators)
+    strongly_female_categories = ["dress", "skirt", "blouse", "leggings", "maxi dress", "evening dress", "party dress"]
+    strongly_male_categories = ["suit", "polo shirt", "blazer", "formal shirt", "tie"]
+    
+    for category in strongly_female_categories:
+        if category in primary_lower:
+            return "women"
+    
+    for category in strongly_male_categories:
+        if category in primary_lower:
+            return "men"
+    
+    return "unisex"
+
 def analyze_image_with_clip(image: Image.Image) -> dict:
-    """Use CLIP to analyze the image and determine product type"""
+    """Use CLIP to analyze the image and determine product type with improved gender detection"""
     try:
+        # Enhanced categories with better gender-specific items and more variety
         categories = [
-            "headphones", "wireless headphones", "earbuds", "gaming headset",
-            "smartphone", "mobile phone", "laptop", "tablet", "computer",
-            "watch", "smartwatch", "fitness tracker",
-            "shoes", "sneakers", "boots", "sandals",
-            "bag", "backpack", "handbag", "purse", "luggage",
-            "clothing", "shirt", "dress", "jacket", "pants",
-            "camera", "DSLR camera", "action camera",
-            "book", "notebook", "magazine",
-            "furniture", "chair", "table", "desk",
-            "toy", "action figure", "doll",
-            "bottle", "water bottle", "thermos",
-            "sunglasses", "eyeglasses",
-            "jewelry", "necklace", "bracelet", "ring",
-            "kitchen appliance", "blender", "coffee maker",
-            "home decor", "lamp", "vase", "picture frame"
+            # Women's clothing (more specific and varied)
+            "women's dress", "women's evening dress", "women's summer dress", "women's party dress",
+            "women's maxi dress", "women's casual dress", "women's black dress", "women's white dress",
+            "women's cocktail dress", "women's formal dress", "women's wedding dress",
+            "women's skirt", "women's mini skirt", "women's long skirt", "women's pleated skirt",
+            "women's top", "women's blouse", "women's t-shirt", "women's shirt", "women's crop top",
+            "women's jeans", "women's pants", "women's trousers", "women's leggings", "women's yoga pants",
+            "women's jacket", "women's coat", "women's sweater", "women's hoodie", "women's cardigan",
+            "women's shorts", "women's jumpsuit", "women's romper", "women's bikini",
+            "women's handbag", "women's purse", "women's heels", "women's sandals",
+            
+            # Men's clothing  
+            "men's shirt", "men's t-shirt", "men's polo shirt", "men's formal shirt",
+            "men's jeans", "men's pants", "men's trousers", "men's chinos", "men's cargo pants",
+            "men's jacket", "men's blazer", "men's suit", "men's coat", "men's leather jacket",
+            "men's shorts", "men's sweater", "men's hoodie", "men's tracksuit",
+            "men's watch", "men's shoes", "men's sneakers", "men's boots",
+            
+            # Gender neutral (less specific)
+            "dress", "skirt", "top", "blouse", "shirt", "t-shirt",
+            "jeans", "pants", "trousers", "jacket", "coat", "sweater",
+            
+            # Accessories
+            "shoes", "handbag", "jewelry", "watch", "sunglasses", "backpack",
+            
+            # Electronics
+            "smartphone", "laptop", "headphones", "camera", "tablet"
         ]
         
         text_prompts = [f"a photo of {cat}" for cat in categories]
@@ -407,22 +536,30 @@ def analyze_image_with_clip(image: Image.Image) -> dict:
             
             similarity = (image_features @ text_features.T).squeeze(0)
             
-        top5_idx = similarity.topk(5).indices.cpu().numpy()
-        top5_scores = similarity.topk(5).values.cpu().numpy()
+        top10_idx = similarity.topk(10).indices.cpu().numpy()
+        top10_scores = similarity.topk(10).values.cpu().numpy()
         
-        detected_categories = [(categories[idx], float(score)) for idx, score in zip(top5_idx, top5_scores)]
+        detected_categories = [(categories[idx], float(score)) for idx, score in zip(top10_idx, top10_scores)]
         
         primary_category = detected_categories[0][0]
         confidence = detected_categories[0][1]
         
-        broad_category = categorize_product(primary_category)
+        # Enhanced gender detection with more context
+        gender = detect_gender_from_category(primary_category, detected_categories)
+        broad_category = categorize_product(primary_category, gender)
+        
+        # Debug information
+        print(f"  [DEBUG] Top categories:")
+        for i, (cat, score) in enumerate(detected_categories[:5]):
+            print(f"    {i+1}. {cat} ({score:.3f})")
         
         return {
             "primary_category": primary_category,
             "confidence": confidence,
             "broad_category": broad_category,
-            "top_matches": detected_categories[:3],
-            "likely_product": confidence > 0.25
+            "gender": gender,
+            "top_matches": detected_categories[:5],
+            "likely_product": confidence > 0.15
         }
         
     except Exception as e:
@@ -431,28 +568,51 @@ def analyze_image_with_clip(image: Image.Image) -> dict:
             "primary_category": "product",
             "confidence": 0.0,
             "broad_category": "general",
+            "gender": "unisex",
             "top_matches": [],
             "likely_product": True
         }
 
-def categorize_product(category: str) -> str:
-    """Map specific category to broader category"""
+def categorize_product(category: str, gender: str) -> str:
+    """Map specific category to broader category with gender consideration"""
+    category_lower = category.lower()
+    
+    # Gender-specific categories
+    if gender == "women":
+        if any(term in category_lower for term in ["dress", "skirt", "blouse", "leggings", "jumpsuit", "romper"]):
+            return "women_fashion"
+        elif any(term in category_lower for term in ["women", "woman", "lady", "female"]):
+            return "women_fashion"
+    
+    elif gender == "men":
+        if any(term in category_lower for term in ["suit", "polo", "blazer", "formal shirt", "tie"]):
+            return "men_fashion"
+        elif any(term in category_lower for term in ["men", "man", "gentleman", "male"]):
+            return "men_fashion"
+    
+    # General category mapping
     category_map = {
-        "electronics": ["headphones", "earbuds", "smartphone", "phone", "laptop", "tablet", 
-                       "computer", "camera", "gaming", "smartwatch", "fitness tracker"],
-        "fashion": ["shoes", "sneakers", "boots", "clothing", "shirt", "dress", "jacket", 
-                   "pants", "sandals"],
-        "accessories": ["bag", "backpack", "handbag", "purse", "watch", "sunglasses", 
-                       "eyeglasses", "jewelry", "necklace", "bracelet", "ring"],
-        "home": ["furniture", "chair", "table", "lamp", "vase", "decor", "kitchen", 
-                "appliance", "blender", "coffee maker"],
-        "other": ["book", "notebook", "toy", "bottle", "magazine", "luggage"]
+        "electronics": ["headphones", "smartphone", "laptop", "tablet", "camera", 
+                       "smartwatch", "phone", "computer", "gaming"],
+        "shoes": ["shoes", "sneakers", "boots", "sandals", "heels", "footwear"],
+        "accessories": ["handbag", "backpack", "watch", "sunglasses", "jewelry", "purse"],
+        "home": ["furniture", "home decor", "lamp", "vase"],
+        "other": ["book", "toy", "bottle", "kitchen"]
     }
     
-    category_lower = category.lower()
     for broad_cat, keywords in category_map.items():
         if any(keyword in category_lower for keyword in keywords):
             return broad_cat
+    
+    # Fallback to general fashion if it contains clothing terms
+    clothing_terms = ["jeans", "pants", "shirt", "dress", "jacket", "skirt", "top", "sweater", "hoodie"]
+    if any(term in category_lower for term in clothing_terms):
+        if gender == "women":
+            return "women_fashion"
+        elif gender == "men":
+            return "men_fashion"
+        else:
+            return "general_fashion"
     
     return "general"
 
@@ -470,12 +630,12 @@ def extract_clip_embedding(image_bytes: bytes) -> List[float]:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
 
-def filter_products_by_color(products: List[dict], target_colors: List[str]) -> List[dict]:
-    """Filter products based on color similarity to target colors with strict matching"""
-    if not target_colors or not products:
+def filter_products_by_attributes(products: List[dict], target_colors: List[str], gender: str, category: str) -> List[dict]:
+    """Filter products based on color, gender, and category with improved matching"""
+    if not products:
         return products
     
-    print(f"[COLOR FILTER] Filtering {len(products)} products by colors: {target_colors}")
+    print(f"[FILTER] Filtering {len(products)} products by: colors={target_colors}, gender={gender}, category={category}")
     
     filtered_products = []
     
@@ -484,45 +644,101 @@ def filter_products_by_color(products: List[dict], target_colors: List[str]) -> 
         description = product.get('description', '').lower()
         combined_text = f"{title} {description}"
         
-        color_match = False
-        match_count = 0
-        
-        for target_color in target_colors:
-            if target_color in combined_text:
-                match_count += 1
-                continue
+        # Color matching (relaxed for black/white)
+        color_match = True
+        if target_colors and target_colors != ["multi-color"]:
+            color_match_count = 0
+            for target_color in target_colors:
+                if target_color in combined_text:
+                    color_match_count += 1
+                    continue
+                
+                color_variations = get_color_variations(target_color)
+                for variation in color_variations:
+                    if variation in combined_text:
+                        color_match_count += 1
+                        break
             
-            color_variations = get_color_variations(target_color)
-            for variation in color_variations:
-                if variation in combined_text:
-                    match_count += 1
-                    break
+            # Relaxed matching for essential colors
+            if len(target_colors) == 1:
+                color_match = (color_match_count > 0)
+            else:
+                required_matches = max(1, len(target_colors) // 2)
+                color_match = (color_match_count >= required_matches)
         
-        if len(target_colors) == 1:
-            color_match = (match_count > 0)
-        else:
-            required_matches = max(1, len(target_colors) // 2)
-            color_match = (match_count >= required_matches)
+        # Gender matching (STRICT)
+        gender_match = True
+        if gender != "unisex":
+            male_terms = ["men", "men's", "male", "boy", "boy's", "guy", "gentleman", "gents"]
+            female_terms = ["women", "women's", "female", "girl", "girl's", "lady", "ladies", "woman's"]
+            
+            if gender == "women":
+                # STRICT: Remove products that are explicitly for men
+                if any(term in combined_text for term in male_terms):
+                    gender_match = False
+                # Bonus: Keep products that are explicitly for women
+                elif any(term in combined_text for term in female_terms):
+                    gender_match = True
+                # For neutral products, keep them
+                else:
+                    gender_match = True
+                    
+            elif gender == "men":
+                # STRICT: Remove products that are explicitly for women
+                if any(term in combined_text for term in female_terms):
+                    gender_match = False
+                # Bonus: Keep products that are explicitly for men
+                elif any(term in combined_text for term in male_terms):
+                    gender_match = True
+                # For neutral products, keep them
+                else:
+                    gender_match = True
         
-        if color_match:
+        # Category matching
+        category_match = True
+        if category and category != "general":
+            category_terms = get_category_search_terms(category, gender)
+            if category_terms:
+                category_match = any(term in combined_text for term in category_terms)
+        
+        if color_match and gender_match and category_match:
             filtered_products.append(product)
     
-    print(f"[COLOR FILTER] Found {len(filtered_products)} products matching target colors")
-    
+    print(f"[FILTER] Found {len(filtered_products)} matching products")
     return filtered_products
+
+def get_category_search_terms(category: str, gender: str) -> List[str]:
+    """Get search terms for specific categories with gender context"""
+    base_terms = {
+        "women_fashion": ["dress", "skirt", "blouse", "top", "leggings", "jumpsuit"],
+        "men_fashion": ["shirt", "polo", "jeans", "pants", "trousers", "jacket"],
+        "general_fashion": ["dress", "shirt", "jeans", "pants", "jacket", "top"],
+        "shoes": ["shoes", "sneakers", "boots", "sandals"],
+        "electronics": ["phone", "laptop", "headphone", "camera", "tablet"]
+    }
+    
+    terms = base_terms.get(category, [])
+    
+    # Add gender-specific terms if available
+    if gender == "women" and category in ["women_fashion", "general_fashion"]:
+        terms.extend(["dress", "skirt", "blouse", "leggings"])
+    elif gender == "men" and category in ["men_fashion", "general_fashion"]:
+        terms.extend(["shirt", "polo", "jeans", "trousers"])
+    
+    return list(set(terms))
 
 def get_color_variations(color: str) -> List[str]:
     """Get variations of a color name"""
     color_variations = {
         "red": ["crimson", "maroon", "burgundy", "cherry", "scarlet", "ruby"],
-        "blue": ["navy", "azure", "cobalt", "sapphire", "teal", "turquoise"],
+        "blue": ["navy", "azure", "cobalt", "sapphire", "teal", "turquoise", "sky blue"],
         "green": ["emerald", "forest", "olive", "lime", "mint", "jade"],
         "yellow": ["gold", "mustard", "amber", "lemon", "cream"],
         "purple": ["violet", "lavender", "magenta", "plum", "lilac"],
         "orange": ["coral", "peach", "apricot", "tangerine"],
         "pink": ["rose", "blush", "fuchsia", "hot pink", "salmon"],
         "brown": ["chocolate", "tan", "beige", "caramel", "coffee"],
-        "black": ["charcoal", "dark", "jet black"],
+        "black": ["charcoal", "dark", "jet black", "ebony"],
         "white": ["ivory", "cream", "off-white", "pearl", "snow"],
         "gray": ["grey", "silver", "charcoal", "ash", "slate"]
     }
@@ -530,7 +746,7 @@ def get_color_variations(color: str) -> List[str]:
     return color_variations.get(color.lower(), [])
 
 async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries: int = 3) -> List[dict]:
-    """Fetch products from Google Custom Search API with rate limiting, caching, and retry logic"""
+    """Fetch products from Google Custom Search API with improved query handling"""
     print(f"[SEARCH] Searching: '{query}' (page {page})")
     
     cached_result = await search_cache.get(query, page)
@@ -561,111 +777,78 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
             "imgSize": "large",
             "safe": "active",
             "fileType": "jpg,png",
-            "imgType": "photo",
-            "sort": "date",
-            "dateRestrict": "m6"
+            "imgType": "photo"
         }
         
-        site_specific_queries = []
-        if "flipkart" in query.lower():
-            site_specific_queries.append(f"site:flipkart.com {query.replace('Flipkart', '').strip()}")
-        if "meesho" in query.lower():
-            site_specific_queries.append(f"site:meesho.com {query.replace('Meesho', '').strip()}")
-        if "amazon" in query.lower():
-            site_specific_queries.append(f"site:amazon.in OR site:amazon.com {query.replace('Amazon', '').strip()}")
-        if "myntra" in query.lower():
-            site_specific_queries.append(f"site:myntra.com {query.replace('Myntra', '').strip()}")
-        if "ajio" in query.lower():
-            site_specific_queries.append(f"site:ajio.com {query.replace('Ajio', '').strip()}")
-        
-        search_variations = [query] + site_specific_queries
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            for search_query in search_variations:
-                if len(products) >= 10:
-                    break
-                
-                current_params = params.copy()
-                current_params["q"] = search_query
-                
-                for attempt in range(max_retries):
-                    try:
-                        response = await client.get(url, params=current_params)
+            for attempt in range(max_retries):
+                try:
+                    response = await client.get(url, params=params)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
                         
-                        if response.status_code == 200:
-                            data = response.json()
-                            
-                            if data.get('items'):
-                                for item in data['items']:
-                                    try:
-                                        if len(products) >= 10:
-                                            break
-                                            
-                                        title = item.get('title', 'Product')
-                                        image_url = item.get('link')
-                                        
-                                        if not image_url:
-                                            continue
-                                        
-                                        if any(skip_term in image_url.lower() for skip_term in ['placeholder', 'no-image', 'default']):
-                                            continue
-                                        
-                                        context = item.get('image', {})
-                                        link = context.get('contextLink', image_url)
-                                        snippet = item.get('snippet', title)
-                                        
-                                        price = extract_price_from_text(f"{title} {snippet}")
-                                        source = detect_source_from_url(link)
-                                        
-                                        product = {
-                                            'title': clean_title(title),
-                                            'image_url': image_url,
-                                            'price': price,
-                                            'description': snippet[:200],
-                                            'link': link,
-                                            'source': source
-                                        }
-                                        products.append(product)
-                                        
-                                    except Exception as e:
-                                        print(f"[WARNING] Error parsing item: {e}")
+                        if data.get('items'):
+                            for item in data['items']:
+                                try:
+                                    title = item.get('title', 'Product')
+                                    image_url = item.get('link')
+                                    
+                                    if not image_url:
                                         continue
-                                
-                                print(f"  [OK] Found {len(products)} products from '{search_query}'")
-                                break
-                                
-                            else:
-                                print(f"  [INFO] No items for '{search_query}'")
-                                break
-                                
-                        elif response.status_code == 429:
-                            print(f"  [RATE LIMIT] Hit rate limit for current API key")
+                                    
+                                    # Skip placeholder images
+                                    if any(skip_term in image_url.lower() for skip_term in ['placeholder', 'no-image', 'default']):
+                                        continue
+                                    
+                                    context = item.get('image', {})
+                                    link = context.get('contextLink', image_url)
+                                    snippet = item.get('snippet', title)
+                                    
+                                    price = extract_price_from_text(f"{title} {snippet}")
+                                    source = detect_source_from_url(link)
+                                    
+                                    product = {
+                                        'title': clean_title(title),
+                                        'image_url': image_url,
+                                        'price': price,
+                                        'description': snippet[:200],
+                                        'link': link,
+                                        'source': source
+                                    }
+                                    products.append(product)
+                                    
+                                except Exception as e:
+                                    print(f"[WARNING] Error parsing item: {e}")
+                                    continue
                             
-                            new_key = api_key_manager.rotate_key()
-                            if new_key and new_key != api_key:
-                                api_key = new_key
-                                current_params["key"] = api_key
-                                print(f"  [RATE LIMIT] Rotated to new API key, retrying...")
-                                await rate_limiter.wait_if_needed(api_key)
-                                continue
-                            else:
-                                wait_time = (2 ** attempt) + (0.5 * attempt)
-                                print(f"  [RATE LIMIT] No more API keys, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
-                                await asyncio.sleep(wait_time)
-                            
-                        else:
-                            print(f"  [ERROR] API error: {response.status_code} for '{search_query}'")
+                            print(f"  [OK] Found {len(products)} products from '{query}'")
                             break
-                            
-                    except Exception as e:
-                        print(f"  [ERROR] Request failed: {e} (attempt {attempt + 1}/{max_retries})")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
+                        
+                    elif response.status_code == 429:
+                        print(f"  [RATE LIMIT] Hit rate limit for current API key")
+                        new_key = api_key_manager.rotate_key()
+                        if new_key and new_key != api_key:
+                            api_key = new_key
+                            params["key"] = api_key
+                            print(f"  [RATE LIMIT] Rotated to new API key, retrying...")
+                            await rate_limiter.wait_if_needed(api_key)
+                            continue
                         else:
-                            break
-                
-                if search_variations.index(search_query) < len(search_variations) - 1:
-                    await asyncio.sleep(1.0)
+                            wait_time = (2 ** attempt) + 1
+                            print(f"  [RATE LIMIT] Waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                            await asyncio.sleep(wait_time)
+                    
+                    else:
+                        print(f"  [ERROR] API error: {response.status_code} for '{query}'")
+                        break
+                        
+                except Exception as e:
+                    print(f"  [ERROR] Request failed: {e} (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        break
                     
         await search_cache.set(query, page, products)
         
@@ -722,40 +905,6 @@ def detect_source_from_url(url: str) -> str:
         return 'Myntra'
     elif 'ajio.' in url_lower:
         return 'Ajio'
-    elif 'nykaa.' in url_lower:
-        return 'Nykaa'
-    elif 'tatacliq.' in url_lower:
-        return 'Tata Cliq'
-    elif 'reliancedigital.' in url_lower:
-        return 'Reliance Digital'
-    elif 'croma.' in url_lower:
-        return 'Croma'
-    elif 'vijaysales.' in url_lower:
-        return 'Vijay Sales'
-    elif 'snapdeal.' in url_lower:
-        return 'Snapdeal'
-    elif 'shopclues.' in url_lower:
-        return 'Shopclues'
-    elif 'paytmmall.' in url_lower:
-        return 'Paytm Mall'
-    elif 'firstcry.' in url_lower:
-        return 'FirstCry'
-    elif 'jabong.' in url_lower or 'abof.' in url_lower:
-        return 'Fashion Store'
-    elif 'bestbuy.' in url_lower:
-        return 'Best Buy'
-    elif 'walmart.' in url_lower:
-        return 'Walmart'
-    elif 'target.' in url_lower:
-        return 'Target'
-    elif 'ebay.' in url_lower:
-        return 'eBay'
-    elif 'aliexpress.' in url_lower:
-        return 'AliExpress'
-    elif 'shopify.' in url_lower:
-        return 'Shopify Store'
-    elif 'google.' in url_lower and ('shopping' in url_lower or 'products' in url_lower):
-        return 'Google Shopping'
     else:
         try:
             from urllib.parse import urlparse
@@ -769,90 +918,64 @@ def detect_source_from_url(url: str) -> str:
         except:
             return 'Unknown'
 
-def generate_search_queries(category_info: dict, colors: List[str], broad_category: str) -> List[str]:
-    """Generate targeted search queries based on detected product"""
+def generate_search_queries(category_info: dict, colors: List[str], broad_category: str, gender: str) -> List[str]:
+    """Generate targeted search queries based on detected product with gender and category"""
     primary_category = category_info.get("primary_category", "product")
     
     queries = []
     
-    queries.append(f"{primary_category} product")
-    queries.append(f"{primary_category} buy online")
-    queries.append(f"{primary_category} shopping")
+    # Clean the primary category by removing gender prefixes for better search
+    clean_category = primary_category
+    if "women's" in clean_category.lower():
+        clean_category = clean_category.replace("women's", "").replace("womens", "").strip()
+    elif "men's" in clean_category.lower():
+        clean_category = clean_category.replace("men's", "").replace("mens", "").strip()
     
-    for color in colors[:2]:
-        if color not in ["multi-color", "mixed"]:
-            queries.append(f"{color} {primary_category}")
-            queries.append(f"{primary_category} {color}")
+    # Base queries with gender context
+    if gender != "unisex":
+        # Gender-specific queries
+        if colors:
+            for color in colors[:2]:
+                if color not in ["multi-color", "mixed"]:
+                    queries.append(f"{gender} {color} {clean_category}")
+                    queries.append(f"{color} {clean_category} for {gender}")
+        else:
+            queries.append(f"{gender} {clean_category}")
+        
+        # Platform-specific with gender
+        platforms = ["Amazon", "Flipkart", "Myntra", "Ajio", "Meesho"]
+        for platform in platforms:
+            queries.append(f"{gender} {clean_category} {platform}")
+        
+        # General gender-specific
+        queries.append(f"{gender} fashion {clean_category}")
+        queries.append(f"buy {gender} {clean_category} online")
     
-    platform_queries = [
-        f"{primary_category} Amazon",
-        f"{primary_category} Flipkart",
-        f"{primary_category} Meesho", 
-        f"{primary_category} Google Shopping",
-        f"{primary_category} Myntra",
-        f"{primary_category} Ajio",
-        f"{primary_category} Nykaa",
-        f"{primary_category} Tata Cliq",
-        f"{primary_category} Reliance Digital",
-        f"{primary_category} Croma",
-        f"{primary_category} Vijay Sales"
-    ]
+    # Color-focused queries (without gender when ambiguous)
+    if colors:
+        for color in colors[:2]:
+            if color not in ["multi-color", "mixed"]:
+                queries.append(f"{color} {clean_category}")
+                queries.append(f"{clean_category} {color}")
     
-    if broad_category == "electronics":
-        queries.extend([
-            f"{primary_category} Best Buy",
-            f"wireless {primary_category}",
-            f"bluetooth {primary_category}",
-            f"{primary_category} tech",
-            f"{primary_category} gadget"
-        ])
-        platform_queries.extend([
-            f"{primary_category} electronic store",
-            f"{primary_category} tech store"
-        ])
-    elif broad_category == "fashion":
-        queries.extend([
-            f"{primary_category} fashion",
-            f"{primary_category} style",
-            f"{primary_category} clothing",
-            f"{primary_category} apparel"
-        ])
-        platform_queries.extend([
-            f"{primary_category} fashion store",
-            f"{primary_category} boutique"
-        ])
-    elif broad_category == "accessories":
-        queries.extend([
-            f"{primary_category} accessories",
-            f"stylish {primary_category}",
-            f"designer {primary_category}",
-            f"{primary_category} collection"
-        ])
-    
-    import random
-    shuffled_platforms = platform_queries.copy()
-    random.shuffle(shuffled_platforms)
-    queries.extend(shuffled_platforms)
-    
+    # Fallback queries
     queries.extend([
-        f"{primary_category} 2024",
-        f"best {primary_category}",
-        f"popular {primary_category}",
-        f"{primary_category} online",
-        f"{primary_category} store",
-        f"buy {primary_category}",
-        f"{primary_category} deal",
-        f"{primary_category} offer"
+        f"{clean_category}",
+        f"buy {clean_category} online",
+        f"{clean_category} shopping",
+        f"{clean_category} 2024"
     ])
     
+    # Remove duplicates while preserving order
     seen = set()
     unique_queries = []
     for query in queries:
-        if query.lower() not in seen:
+        if query.lower() not in seen and len(query) > 3:
             seen.add(query.lower())
             unique_queries.append(query)
     
-    return unique_queries[:20]
+    print(f"  [QUERY DEBUG] First 5 queries: {unique_queries[:5]}")
+    return unique_queries[:15]
 
 async def index_products(products: List[dict]) -> int:
     """Index products in Qdrant with CLIP embeddings"""
@@ -900,12 +1023,12 @@ async def index_products(products: List[dict]) -> int:
     return len(points)
 
 # ────────────────────────────────
-# PRODUCT SEARCH ENDPOINTS
+# IMPROVED PRODUCT SEARCH ENDPOINT
 # ────────────────────────────────
 
 @app.post("/search", response_model=SearchResponse)
 async def search_similar_products(image: UploadFile = File(...)):
-    """Upload an image and find visually similar products"""
+    """Upload an image and find visually similar products with improved filtering"""
     try:
         try:
             qdrant_client.delete_collection(COLLECTION_NAME)
@@ -932,37 +1055,33 @@ async def search_similar_products(image: UploadFile = File(...)):
         print(f"  Detected: {category_info['primary_category']}")
         print(f"  Confidence: {category_info['confidence']:.2%}")
         print(f"  Category: {category_info['broad_category']}")
+        print(f"  Gender: {category_info['gender']}")
         print(f"  Colors: {', '.join(colors)}")
-        
-        if len(category_info['top_matches']) > 1:
-            print(f"  Also matches: {', '.join([m[0] for m in category_info['top_matches'][1:3]])}")
         
         print(f"\n[QUERY] Generating search queries...")
         search_queries = generate_search_queries(
             category_info, 
             colors, 
-            category_info['broad_category']
+            category_info['broad_category'],
+            category_info['gender']
         )
         print(f"  Generated {len(search_queries)} queries")
         
         print(f"\n[GOOGLE] Searching Google Custom Search API...")
         all_products = []
-        max_products = 100
+        max_products = 80
         
         for i, query in enumerate(search_queries):
             if len(all_products) >= max_products:
                 break
             
-            for page in [1, 2]:
-                if len(all_products) >= max_products:
-                    break
-                    
-                products = await fetch_from_google_custom_search(query, page)
-                all_products.extend(products)
-                
-                if page == 1 and products:
-                    await asyncio.sleep(0.5)
+            products = await fetch_from_google_custom_search(query, 1)
+            all_products.extend(products)
+            
+            # Small delay between queries
+            await asyncio.sleep(0.3)
         
+        # Remove duplicates
         seen_urls = set()
         unique_products = []
         for product in all_products:
@@ -979,8 +1098,22 @@ async def search_similar_products(image: UploadFile = File(...)):
                 detail="No products found. Please check your Google Custom Search API configuration."
             )
         
+        # Apply attribute filtering BEFORE indexing
+        print(f"\n[FILTER] Applying attribute-based filtering...")
+        filtered_products = filter_products_by_attributes(
+            unique_products, 
+            colors, 
+            category_info['gender'],
+            category_info['broad_category']
+        )
+        
+        print(f"  After attribute filtering: {len(filtered_products)} products")
+        
         query_embedding = extract_clip_embedding(image_bytes)
-        indexed_count = await index_products(unique_products)
+        
+        # Use filtered products for indexing, fallback to all if filtering is too strict
+        products_to_index = filtered_products if len(filtered_products) > 10 else unique_products
+        indexed_count = await index_products(products_to_index)
         
         if indexed_count == 0:
             raise HTTPException(
@@ -992,18 +1125,24 @@ async def search_similar_products(image: UploadFile = File(...)):
         search_results = qdrant_client.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_embedding,
-            limit=30
+            limit=40
         )
         
         print(f"  Found {len(search_results)} candidates")
         
-        min_threshold = 0.60 if category_info['broad_category'] == 'electronics' else 0.65
+        # Dynamic similarity threshold based on category
+        min_threshold = 0.55
+        if category_info['broad_category'] in ['women_fashion', 'men_fashion']:
+            min_threshold = 0.60
+        elif category_info['broad_category'] == 'electronics':
+            min_threshold = 0.58
         
+        # Filter by similarity and remove duplicates
         filtered_results = []
         seen_titles = set()
         
         for hit in search_results:
-            if len(filtered_results) >= 20:
+            if len(filtered_results) >= 25:
                 break
                 
             if hit.score >= min_threshold:
@@ -1012,24 +1151,8 @@ async def search_similar_products(image: UploadFile = File(...)):
                     seen_titles.add(title_lower)
                     filtered_results.append(hit)
         
-        print(f"  Filtered to {len(filtered_results)} high-quality matches")
-        
-        if colors:
-            print(f"[COLOR] Applying color filter for: {colors}")
-            products_for_color_filter = [hit.payload for hit in filtered_results]
-            color_filtered_products = filter_products_by_color(products_for_color_filter, colors)
-            
-            color_filtered_urls = {product['image_url'] for product in color_filtered_products}
-            
-            final_filtered_results = []
-            for hit in filtered_results:
-                if hit.payload['image_url'] in color_filtered_urls:
-                    final_filtered_results.append(hit)
-            
-            print(f"[COLOR] After color filtering: {len(final_filtered_results)} products")
-            
-            if final_filtered_results:
-                filtered_results = final_filtered_results
+        print(f"  After similarity filtering: {len(filtered_results)} products")
+        print(f"  Similarity threshold: {min_threshold:.2f}")
         
         results = []
         sources = set()
@@ -1050,15 +1173,19 @@ async def search_similar_products(image: UploadFile = File(...)):
         
         print("\n" + "="*70)
         print(f"[COMPLETE] SEARCH COMPLETE: {len(results)} results")
+        print(f"  Primary match: {category_info['primary_category']}")
+        print(f"  Gender: {category_info['gender']}")
+        print(f"  Colors: {colors}")
         print("="*70 + "\n")
         
         return SearchResponse(
-            results=results,
+            results=results[:20],  # Return top 20 results
             total_scraped=len(unique_products),
             sources=list(sources),
             detected_category=category_info['primary_category'],
             detected_attributes={
                 "colors": colors,
+                "gender": category_info['gender'],
                 "broad_category": category_info['broad_category'],
                 "confidence": category_info['confidence']
             }
@@ -1072,6 +1199,8 @@ async def search_similar_products(image: UploadFile = File(...)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
+# ... (keep the rest of your endpoints the same)
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -1082,10 +1211,7 @@ async def health_check():
         "apis_configured": ["Google Custom Search API"] if os.getenv("GOOGLE_API_KEY") else [],
     }
 
-# ────────────────────────────────
-# COLLECTION ENDPOINTS
-# ────────────────────────────────
-
+# Collection endpoints
 @app.post("/collection/add")
 async def add_to_collection(image_url: str, user_id: str = "anonymous"):
     """Add an image to user's collection"""
@@ -1158,25 +1284,13 @@ async def clear_user_collection(user_id: str = "anonymous"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear collection: {str(e)}")
 
-# ────────────────────────────────
-# VIRTUAL TRY-ON ENDPOINTS
-# ────────────────────────────────
-
+# Virtual Try-On endpoints
 @app.post("/api/tryon")
 async def try_on(
     human_image: UploadFile = File(...),
     garment_image: UploadFile = File(...),
 ):
-    """
-    Upload a human image and garment image → returns generated try-on image.
-    
-    Parameters:
-    - human_image: Image of the person
-    - garment_image: Image of the clothing item to try on
-    
-    Returns:
-    - PNG image with the person wearing the garment
-    """
+    """Virtual try-on endpoint"""
     temp_human_path = None
     temp_garm_path = None
     
@@ -1224,54 +1338,36 @@ async def try_on_from_collection(
     user_id: str = Form("anonymous")
 ):
     """
-    Try on a garment from the user's collection or from a URL.
-    
-    Parameters:
-    - human_image: Image of the person
-    - garment_url: URL of the garment image from collection
-    - user_id: User identifier
-    
-    Returns:
-    - PNG image with the person wearing the garment
+    Try on a garment from a URL (e.g., user's collection).
+    - human_image: uploaded portrait/full-body image
+    - garment_url: image URL of the garment to try on
+    - user_id: optional identifier (unused here but reserved)
     """
     temp_human_path = None
     temp_garm_path = None
-    
     try:
-        print("\n[TRYON] Starting try-on from collection...")
-        
         if not garment_url:
             raise HTTPException(status_code=400, detail="garment_url is required")
-        
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_human:
             temp_human.write(await human_image.read())
             temp_human_path = temp_human.name
-            print(f"  Saved human image: {temp_human_path}")
-        
-        print(f"  Downloading garment from: {garment_url}")
+
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(garment_url)
-            if response.status_code != 200:
+            resp = await client.get(garment_url)
+            if resp.status_code != 200:
                 raise HTTPException(status_code=400, detail="Failed to download garment image")
-            
             with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_garm:
-                temp_garm.write(response.content)
+                temp_garm.write(resp.content)
                 temp_garm_path = temp_garm.name
-                print(f"  Saved garment image: {temp_garm_path}")
-        
-        print("  Processing with Leffa model...")
+
         output_path = process_tryon_image(temp_human_path, temp_garm_path)
-        
-        print(f"  [OK] Try-on complete: {output_path}")
-        
         return FileResponse(output_path, media_type="image/png")
 
     except HTTPException:
         raise
     except Exception as e:
-        print(f"  [ERROR] Try-on failed: {str(e)}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
-    
     finally:
         if temp_human_path and os.path.exists(temp_human_path):
             try:
@@ -1283,40 +1379,6 @@ async def try_on_from_collection(
                 os.unlink(temp_garm_path)
             except:
                 pass
-
-
-@app.post("/api/detect_pose")
-async def detect_pose_api(image: UploadFile = File(...)):
-    """
-    Detect and return pose keypoints from a human image.
-    
-    Parameters:
-    - image: Image of the person
-    
-    Returns:
-    - JSON with pose keypoints (shoulders, hips)
-    """
-    try:
-        print("\n[POSE] Detecting pose landmarks...")
-        
-        img_bytes = await image.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        image_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        keypoints = detect_pose(image_cv)
-        
-        print(f"  [OK] Detected {len(keypoints)} keypoints")
-
-        return JSONResponse(content={"pose_keypoints": keypoints})
-
-    except Exception as e:
-        print(f"  [ERROR] Pose detection failed: {str(e)}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-# ────────────────────────────────
-# DATABASE MANAGEMENT
-# ────────────────────────────────
 
 @app.delete("/clear-database")
 async def clear_database():
@@ -1340,8 +1402,6 @@ def root():
         "endpoints": {
             "product_search": "/search",
             "virtual_tryon": "/api/tryon",
-            "tryon_from_collection": "/api/tryon/from-collection",
-            "pose_detection": "/api/detect_pose",
             "collection": {
                 "add": "/collection/add",
                 "list": "/collection/list",
