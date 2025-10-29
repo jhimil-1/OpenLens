@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Search, AlertCircle, Loader2, ExternalLink, DollarSign, ShoppingCart, X, Trash2 } from 'lucide-react';
+import { Upload, Search, AlertCircle, Loader2, ExternalLink, DollarSign, ShoppingCart, X, Trash2, User, Sparkles } from 'lucide-react';
 
 export default function VisualProductSearch() {
   const styles = `
@@ -41,6 +41,15 @@ export default function VisualProductSearch() {
   const [collection, setCollection] = useState([]);
   const [addedToCollection, setAddedToCollection] = useState({});
   const [showCollection, setShowCollection] = useState(false);
+
+  // Virtual Try-On states
+  const [showTryOn, setShowTryOn] = useState(false);
+  const [humanImage, setHumanImage] = useState(null);
+  const [humanImagePreview, setHumanImagePreview] = useState(null);
+  const [selectedGarment, setSelectedGarment] = useState(null);
+  const [tryOnLoading, setTryOnLoading] = useState(false);
+  const [tryOnResult, setTryOnResult] = useState(null);
+  const [tryOnError, setTryOnError] = useState(null);
 
   // Load collection from backend on component mount
   useEffect(() => {
@@ -158,6 +167,60 @@ export default function VisualProductSearch() {
     }
   };
 
+  // Virtual Try-On handlers
+  const handleHumanImageUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setHumanImage(file);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setHumanImagePreview(reader.result);
+      };
+      reader.readAsDataURL(file);
+      setTryOnResult(null);
+      setTryOnError(null);
+    }
+  };
+
+  const handleTryOn = async () => {
+    if (!humanImage || !selectedGarment) {
+      setTryOnError('Please upload your photo and select a garment');
+      return;
+    }
+
+    setTryOnLoading(true);
+    setTryOnError(null);
+    setTryOnResult(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('human_image', humanImage);
+      
+      // Fetch the garment image and convert to file
+      const garmentResponse = await fetch(selectedGarment);
+      const garmentBlob = await garmentResponse.blob();
+      formData.append('garment_image', garmentBlob, 'garment.png');
+
+      const response = await fetch('http://localhost:8003/api/tryon', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Try-on failed: ${response.statusText}`);
+      }
+
+      // Convert response to blob and create object URL
+      const resultBlob = await response.blob();
+      const resultUrl = URL.createObjectURL(resultBlob);
+      setTryOnResult(resultUrl);
+    } catch (err) {
+      setTryOnError(err.message);
+    } finally {
+      setTryOnLoading(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-purple-50 to-blue-50 p-8">
       <div className="max-w-7xl mx-auto">
@@ -166,21 +229,38 @@ export default function VisualProductSearch() {
             <h1 className="text-4xl font-bold text-gray-900">
               Visual Product Search
             </h1>
-            <button
-              onClick={() => {
-                setShowCollection(true);
-                loadCollectionFromBackend();
-              }}
-              className={`px-4 py-2 rounded-full flex items-center gap-2 transition-colors ${
-                collection.length > 0
-                  ? 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'
-                  : 'bg-gray-200 text-gray-500 cursor-not-allowed'
-              }`}
-              disabled={collection.length === 0}
-            >
-              <ShoppingCart size={20} />
-              <span className="font-semibold">{collection.length} items</span>
-            </button>
+            <div className="flex gap-3">
+              <button
+                onClick={() => {
+                  setShowTryOn(true);
+                  loadCollectionFromBackend();
+                }}
+                className={`px-4 py-2 rounded-full flex items-center gap-2 transition-colors ${
+                  collection.length > 0
+                    ? 'bg-blue-600 hover:bg-blue-700 text-white cursor-pointer'
+                    : 'bg-gray-200 text-gray-500 cursor-not-allowed'
+                }`}
+                disabled={collection.length === 0}
+              >
+                <User size={20} />
+                <span className="font-semibold">Virtual Try-On</span>
+              </button>
+              <button
+                onClick={() => {
+                  setShowCollection(true);
+                  loadCollectionFromBackend();
+                }}
+                className={`px-4 py-2 rounded-full flex items-center gap-2 transition-colors ${
+                  collection.length > 0
+                    ? 'bg-green-600 hover:bg-green-700 text-white cursor-pointer'
+                    : 'bg-gray-200 text-gray-500 cursor-not-allowed'
+                }`}
+                disabled={collection.length === 0}
+              >
+                <ShoppingCart size={20} />
+                <span className="font-semibold">{collection.length} items</span>
+              </button>
+            </div>
           </div>
           <p className="text-gray-600">
             Upload an image to find visually similar products using AI-powered CLIP embeddings
@@ -390,6 +470,147 @@ export default function VisualProductSearch() {
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Virtual Try-On Modal */}
+      {showTryOn && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg p-6 max-w-6xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-3xl font-bold flex items-center gap-2">
+                <Sparkles className="text-blue-600" />
+                Virtual Try-On
+              </h2>
+              <button
+                onClick={() => {
+                  setShowTryOn(false);
+                  setHumanImage(null);
+                  setHumanImagePreview(null);
+                  setSelectedGarment(null);
+                  setTryOnResult(null);
+                  setTryOnError(null);
+                }}
+                className="text-gray-500 hover:text-gray-700"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+              {/* Upload Human Photo */}
+              <div>
+                <h3 className="text-lg font-semibold mb-3">1. Upload Your Photo</h3>
+                <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors">
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleHumanImageUpload}
+                    className="hidden"
+                    id="human-image-upload"
+                  />
+                  <label htmlFor="human-image-upload" className="cursor-pointer">
+                    {humanImagePreview ? (
+                      <img
+                        src={humanImagePreview}
+                        alt="Your photo"
+                        className="max-h-64 mx-auto rounded-lg"
+                      />
+                    ) : (
+                      <div>
+                        <User className="mx-auto h-12 w-12 text-gray-400 mb-2" />
+                        <p className="text-gray-600">Click to upload your photo</p>
+                        <p className="text-sm text-gray-500 mt-1">Full body photo works best</p>
+                      </div>
+                    )}
+                  </label>
+                </div>
+              </div>
+
+              {/* Select Garment */}
+              <div>
+                <h3 className="text-lg font-semibold mb-3">2. Select Garment from Collection</h3>
+                <div className="border-2 border-gray-300 rounded-lg p-4 max-h-80 overflow-y-auto">
+                  {collection.length === 0 ? (
+                    <p className="text-gray-500 text-center py-8">No items in collection</p>
+                  ) : (
+                    <div className="grid grid-cols-3 gap-3">
+                      {collection.map((item) => (
+                        <div
+                          key={item.collectionId}
+                          onClick={() => setSelectedGarment(item.image_url)}
+                          className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${
+                            selectedGarment === item.image_url
+                              ? 'border-blue-500 ring-2 ring-blue-300'
+                              : 'border-transparent hover:border-gray-300'
+                          }`}
+                        >
+                          <img
+                            src={item.image_url}
+                            alt="Garment"
+                            className="w-full h-24 object-cover"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Try On Button */}
+            <div className="mb-6">
+              <button
+                onClick={handleTryOn}
+                disabled={!humanImage || !selectedGarment || tryOnLoading}
+                className="w-full bg-blue-600 text-white px-8 py-4 rounded-lg font-semibold hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2"
+              >
+                {tryOnLoading ? (
+                  <>
+                    <Loader2 className="animate-spin" size={20} />
+                    Generating Virtual Try-On... (This may take 30-60 seconds)
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={20} />
+                    Generate Virtual Try-On
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* Error Message */}
+            {tryOnError && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4">
+                <p className="font-semibold">Error:</p>
+                <p>{tryOnError}</p>
+              </div>
+            )}
+
+            {/* Result */}
+            {tryOnResult && (
+              <div>
+                <h3 className="text-lg font-semibold mb-3">✨ Your Virtual Try-On Result</h3>
+                <div className="bg-gray-50 rounded-lg p-4">
+                  <img
+                    src={tryOnResult}
+                    alt="Try-on result"
+                    className="max-w-full mx-auto rounded-lg shadow-lg"
+                  />
+                  <div className="mt-4 text-center">
+                    <a
+                      href={tryOnResult}
+                      download="virtual-tryon-result.png"
+                      className="inline-flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg font-medium transition-colors"
+                    >
+                      <Upload size={16} />
+                      Download Result
+                    </a>
+                  </div>
+                </div>
               </div>
             )}
           </div>

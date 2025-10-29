@@ -15,3 +15,8 @@ lxml
 scikit-learn
 pymongo
 motor
+gradio_client
+
+# Optional dependencies for pose detection (requires Python 3.11 or lower)
+# opencv-python
+# mediapipe

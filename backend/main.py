@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import torch
@@ -20,6 +21,17 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
+import tempfile
+from gradio_client import Client, handle_file
+
+# Optional imports for pose detection
+try:
+    import cv2
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    print("[WARNING] MediaPipe/OpenCV not available. Pose detection will be disabled.")
 
 load_dotenv()
 
@@ -166,6 +178,20 @@ qdrant_client = QdrantClient(
 )
 
 COLLECTION_NAME = "product_embeddings"
+
+# ────────────────────────────────
+# Initialize MediaPipe Pose for Virtual Try-On (Optional)
+# ────────────────────────────────
+if MEDIAPIPE_AVAILABLE:
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=True)
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose_landmark = mp_pose.PoseLandmark
+else:
+    mp_pose = None
+    pose = None
+    mp_drawing = None
+    mp_pose_landmark = None
 
 # Pydantic models
 class ProductResult(BaseModel):
@@ -515,6 +541,64 @@ def get_color_variations(color: str) -> List[str]:
     }
     
     return color_variations.get(color.lower(), [])
+
+# ────────────────────────────────
+# Virtual Try-On Helper Functions
+# ────────────────────────────────
+def detect_pose(image):
+    """
+    Detect pose landmarks from an image using MediaPipe.
+    Returns keypoints for shoulders and hips.
+    Note: Requires MediaPipe to be installed.
+    """
+    if not MEDIAPIPE_AVAILABLE:
+        raise HTTPException(
+            status_code=501, 
+            detail="Pose detection is not available. MediaPipe is not installed (requires Python 3.11 or lower)."
+        )
+    
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    result = pose.process(image_rgb)
+    keypoints = {}
+
+    if result.pose_landmarks:
+        mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+        height, width, _ = image.shape
+
+        for name, index in {
+            'left_shoulder': mp_pose_landmark.LEFT_SHOULDER,
+            'right_shoulder': mp_pose_landmark.RIGHT_SHOULDER,
+            'left_hip': mp_pose_landmark.LEFT_HIP,
+            'right_hip': mp_pose_landmark.RIGHT_HIP,
+        }.items():
+            lm = result.pose_landmarks.landmark[index]
+            keypoints[name] = (int(lm.x * width), int(lm.y * height))
+
+    return keypoints
+
+
+def process_image(human_img_path: str, garm_img_path: str):
+    """
+    Call the Gradio client (Leffa model) to perform virtual try-on.
+    Returns the path to the generated try-on image.
+    """
+    client = Client("franciszzj/Leffa")
+
+    result = client.predict(
+        src_image_path=handle_file(human_img_path),
+        ref_image_path=handle_file(garm_img_path),
+        ref_acceleration=False,
+        step=30,
+        scale=2.5,
+        seed=42,
+        vt_model_type="viton_hd",
+        vt_garment_type="upper_body",
+        vt_repaint=False,
+        api_name="/leffa_predict_vt",
+    )
+
+    generated_image_path = result[0]
+    return generated_image_path
 
 async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries: int = 3) -> List[dict]:
     """
@@ -1200,6 +1284,68 @@ async def clear_user_collection(user_id: str = "anonymous"):
         return {"message": f"Collection cleared. {result.deleted_count} items removed."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear collection: {str(e)}")
+
+# ────────────────────────────────
+# Virtual Try-On API Endpoints
+# ────────────────────────────────
+
+@app.post("/api/tryon")
+async def try_on(
+    human_image: UploadFile = File(...),
+    garment_image: UploadFile = File(...),
+):
+    """
+    Upload a human image and garment image → returns generated try-on image.
+    This endpoint allows users to virtually try on garments from their collection.
+    """
+    try:
+        # Save temporary files
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_human:
+            temp_human.write(await human_image.read())
+            human_path = temp_human.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_garm:
+            temp_garm.write(await garment_image.read())
+            garm_path = temp_garm.name
+
+        # Run virtual try-on model
+        output_path = process_image(human_path, garm_path)
+
+        # Return final image
+        return FileResponse(output_path, media_type="image/png")
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/api/detect_pose")
+async def detect_pose_api(image: UploadFile = File(...)):
+    """
+    Detect and return pose keypoints from a human image.
+    Useful for validating if the uploaded image is suitable for virtual try-on.
+    Note: This endpoint requires MediaPipe (Python 3.11 or lower).
+    """
+    if not MEDIAPIPE_AVAILABLE:
+        return JSONResponse(
+            content={
+                "error": "Pose detection is not available. MediaPipe requires Python 3.11 or lower.",
+                "available": False
+            }, 
+            status_code=501
+        )
+    
+    try:
+        img_bytes = await image.read()
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        image_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        keypoints = detect_pose(image_cv)
+
+        return JSONResponse(content={"pose_keypoints": keypoints, "available": True})
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
 
 @app.delete("/clear-database")
 async def clear_database():
