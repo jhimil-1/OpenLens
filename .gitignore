@@ -1,6 +1,10 @@
 # Environment
 .env
 .env.local
+# Ignore dependencies
+node_modules/
+frontend/node_modules/
+
 
 # Python
 __pycache__/
