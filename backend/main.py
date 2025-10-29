@@ -28,6 +28,13 @@ from gradio_client import Client, handle_file
 try:
     import cv2
     import mediapipe as mp
+    
+    # Initialize MediaPipe Pose
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=True)
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose_landmark = mp_pose.PoseLandmark
+    
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
@@ -180,376 +187,12 @@ qdrant_client = QdrantClient(
 COLLECTION_NAME = "product_embeddings"
 
 # ────────────────────────────────
-# Initialize MediaPipe Pose for Virtual Try-On (Optional)
-# ────────────────────────────────
-if MEDIAPIPE_AVAILABLE:
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=True)
-    mp_drawing = mp.solutions.drawing_utils
-    mp_pose_landmark = mp_pose.PoseLandmark
-else:
-    mp_pose = None
-    pose = None
-    mp_drawing = None
-    mp_pose_landmark = None
-
-# Pydantic models
-class ProductResult(BaseModel):
-    title: str
-    image_url: str
-    price: Optional[str] = None
-    description: Optional[str] = None
-    link: str
-    similarity: float
-    source: str
-
-class CollectionItem(BaseModel):
-    image_url: str
-    collection_id: str
-    created_at: datetime
-
-class CollectionResponse(BaseModel):
-    items: List[CollectionItem]
-    total: int
-
-class SearchResponse(BaseModel):
-    results: List[ProductResult]
-    total_scraped: int
-    sources: List[str]
-    detected_category: Optional[str] = None
-    detected_attributes: Optional[dict] = None
-
-# Initialize collection on startup
-@app.on_event("startup")
-async def startup_event():
-    """Create Qdrant collection if it doesn't exist"""
-    try:
-        collections = qdrant_client.get_collections().collections
-        if not any(col.name == COLLECTION_NAME for col in collections):
-            qdrant_client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=512, distance=Distance.COSINE),
-            )
-            print(f"[OK] Created collection: {COLLECTION_NAME}")
-        else:
-            print(f"[OK] Collection {COLLECTION_NAME} already exists")
-    except Exception as e:
-        print(f"[ERROR] Error initializing collection: {e}")
-
-def extract_dominant_colors(image: Image.Image, num_colors: int = 3) -> List[str]:
-    """Extract dominant colors from image with aggressive red detection"""
-    try:
-        image = image.convert("RGB")
-        image = image.resize((100, 100))  # Smaller for faster processing
-        
-        pixels = np.array(image).reshape(-1, 3)
-        
-        # Sample pixels for faster processing
-        if len(pixels) > 3000:
-            indices = np.random.choice(len(pixels), 3000, replace=False)
-            pixels = pixels[indices]
-        
-        # Aggressive red detection - check if red is dominant
-        red_pixels = 0
-        total_pixels = len(pixels)
-        
-        for pixel in pixels:
-            r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
-            # Check for red-ish colors (aggressive detection)
-            if r > 120 and g < 100 and b < 100:
-                red_pixels += 1
-        
-        # If red constitutes more than 10% of the image, force red detection
-        if red_pixels > total_pixels * 0.1:
-            print(f"[COLOR DETECTION] Aggressive red detection: {red_pixels}/{total_pixels} pixels are red-ish")
-            return ["red"]
-        
-        # Simple k-means-like clustering for other colors
-        from collections import defaultdict
-        color_groups = []
-        
-        for pixel in pixels:
-            r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
-            # Aggressive quantization to reduce variations
-            r_q = (r // 60) * 60
-            g_q = (g // 60) * 60
-            b_q = (b // 60) * 60
-            
-            found = False
-            for i, (cr, cg, cb, count) in enumerate(color_groups):
-                if abs(r_q - cr) < 80 and abs(g_q - cg) < 80 and abs(b_q - cb) < 80:
-                    color_groups[i] = (
-                        int((cr * count + r) / (count + 1)),
-                        int((cg * count + g) / (count + 1)),
-                        int((cb * count + b) / (count + 1)),
-                        count + 1
-                    )
-                    found = True
-                    break
-            
-            if not found and len(color_groups) < num_colors * 2:
-                color_groups.append((r, g, b, 1))
-        
-        color_groups.sort(key=lambda x: x[3], reverse=True)
-        
-        # Get color names with confidence threshold
-        colors = []
-        for center in color_groups[:num_colors]:
-            r, g, b, count = center
-            confidence = count / total_pixels
-            
-            # Only include colors with sufficient confidence (>5% of image)
-            if confidence > 0.05:
-                color_name = get_color_name(r, g, b)
-                if color_name not in colors:
-                    colors.append(color_name)
-        
-        # If we detected colors, return them; otherwise return multi-color
-        return colors if colors else ["multi-color"]
-    except Exception as e:
-        print(f"[WARNING] Color extraction error: {e}")
-        return ["multi-color"]
-
-def get_color_name(r: int, g: int, b: int) -> str:
-    """Convert RGB to color name with aggressive red detection"""
-    # Calculate brightness
-    brightness = (r + g + b) / 3
-    
-    # AGGRESSIVE RED DETECTION - Check for red-ish colors first
-    if r > 120 and g < 100 and b < 100:
-        # Strong red detection
-        if r > 150 and g < 80 and b < 80:
-            return "red"
-        # Lighter red/orange-ish
-        elif g > 60:
-            return "orange"
-        else:
-            return "red"
-    
-    # Black and white
-    if brightness < 50:
-        return "black"
-    if brightness > 200 and abs(r - g) < 30 and abs(g - b) < 30:
-        return "white"
-    
-    # Calculate dominant channel
-    max_val = max(r, g, b)
-    
-    # Gray
-    if abs(r - g) < 30 and abs(g - b) < 30 and abs(r - b) < 30:
-        return "gray"
-    
-    # Primary and secondary colors (only if not red-ish)
-    if r > g + 30 and r > b + 30:
-        if g > b + 20:
-            return "orange"
-        return "red"
-    elif g > r + 30 and g > b + 30:
-        return "green"
-    elif b > r + 30 and b > g + 30:
-        if b > 180 and r > 100:
-            return "purple"
-        return "blue"
-    elif r > 100 and g > 100 and b < 100:
-        return "yellow"
-    elif r > 100 and b > 100:
-        return "pink" if brightness > 150 else "purple"
-    elif g > 100 and b > 100:
-        return "cyan"
-    elif r > 80 and g > 60 and b < 70:
-        return "brown"
-    
-    # Final fallback - if still has red-ish tint, call it red
-    if r > 100 and g < 90 and b < 90:
-        return "red"
-    
-    return "multi-color"
-
-def analyze_image_with_clip(image: Image.Image) -> dict:
-    """Use CLIP to analyze the image and determine product type"""
-    try:
-        # Product categories to test
-        categories = [
-            "headphones", "wireless headphones", "earbuds", "gaming headset",
-            "smartphone", "mobile phone", "laptop", "tablet", "computer",
-            "watch", "smartwatch", "fitness tracker",
-            "shoes", "sneakers", "boots", "sandals",
-            "bag", "backpack", "handbag", "purse", "luggage",
-            "clothing", "shirt", "dress", "jacket", "pants",
-            "camera", "DSLR camera", "action camera",
-            "book", "notebook", "magazine",
-            "furniture", "chair", "table", "desk",
-            "toy", "action figure", "doll",
-            "bottle", "water bottle", "thermos",
-            "sunglasses", "eyeglasses",
-            "jewelry", "necklace", "bracelet", "ring",
-            "kitchen appliance", "blender", "coffee maker",
-            "home decor", "lamp", "vase", "picture frame"
-        ]
-        
-        # Create text prompts
-        text_prompts = [f"a photo of {cat}" for cat in categories]
-        
-        # Encode image
-        image_input = preprocess(image).unsqueeze(0).to(device)
-        
-        # Encode text
-        text_tokens = tokenizer(text_prompts).to(device)
-        
-        with torch.no_grad():
-            image_features = model.encode_image(image_input)
-            text_features = model.encode_text(text_tokens)
-            
-            # Normalize
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            
-            # Calculate similarity
-            similarity = (image_features @ text_features.T).squeeze(0)
-            
-        # Get top 5 matches
-        top5_idx = similarity.topk(5).indices.cpu().numpy()
-        top5_scores = similarity.topk(5).values.cpu().numpy()
-        
-        detected_categories = [(categories[idx], float(score)) for idx, score in zip(top5_idx, top5_scores)]
-        
-        # Get primary category
-        primary_category = detected_categories[0][0]
-        confidence = detected_categories[0][1]
-        
-        # Determine broader category
-        broad_category = categorize_product(primary_category)
-        
-        return {
-            "primary_category": primary_category,
-            "confidence": confidence,
-            "broad_category": broad_category,
-            "top_matches": detected_categories[:3],
-            "likely_product": confidence > 0.25
-        }
-        
-    except Exception as e:
-        print(f"[WARNING] CLIP analysis error: {e}")
-        return {
-            "primary_category": "product",
-            "confidence": 0.0,
-            "broad_category": "general",
-            "top_matches": [],
-            "likely_product": True
-        }
-
-def categorize_product(category: str) -> str:
-    """Map specific category to broader category"""
-    category_map = {
-        "electronics": ["headphones", "earbuds", "smartphone", "phone", "laptop", "tablet", 
-                       "computer", "camera", "gaming", "smartwatch", "fitness tracker"],
-        "fashion": ["shoes", "sneakers", "boots", "clothing", "shirt", "dress", "jacket", 
-                   "pants", "sandals"],
-        "accessories": ["bag", "backpack", "handbag", "purse", "watch", "sunglasses", 
-                       "eyeglasses", "jewelry", "necklace", "bracelet", "ring"],
-        "home": ["furniture", "chair", "table", "lamp", "vase", "decor", "kitchen", 
-                "appliance", "blender", "coffee maker"],
-        "other": ["book", "notebook", "toy", "bottle", "magazine", "luggage"]
-    }
-    
-    category_lower = category.lower()
-    for broad_cat, keywords in category_map.items():
-        if any(keyword in category_lower for keyword in keywords):
-            return broad_cat
-    
-    return "general"
-
-def extract_clip_embedding(image_bytes: bytes) -> List[float]:
-    """Extract CLIP embedding from image bytes"""
-    try:
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image_input = preprocess(image).unsqueeze(0).to(device)
-        
-        with torch.no_grad():
-            image_features = model.encode_image(image_input)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        
-        return image_features.cpu().numpy().flatten().tolist()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
-
-def filter_products_by_color(products: List[dict], target_colors: List[str]) -> List[dict]:
-    """Filter products based on color similarity to target colors with strict matching"""
-    if not target_colors or not products:
-        return products
-    
-    print(f"[COLOR FILTER] Filtering {len(products)} products by colors: {target_colors}")
-    
-    filtered_products = []
-    
-    for product in products:
-        title = product.get('title', '').lower()
-        description = product.get('description', '').lower()
-        combined_text = f"{title} {description}"
-        
-        # Check if any target color appears in the product text
-        color_match = False
-        match_count = 0
-        
-        for target_color in target_colors:
-            # Check for exact color match
-            if target_color in combined_text:
-                match_count += 1
-                continue
-            
-            # Check for color variations (e.g., "red" matches "crimson", "maroon")
-            color_variations = get_color_variations(target_color)
-            for variation in color_variations:
-                if variation in combined_text:
-                    match_count += 1
-                    break
-        
-        # STRICT FILTERING: Only include if we match ALL detected colors
-        # This prevents white dresses from appearing when searching for red
-        if len(target_colors) == 1:
-            # Single color search - require at least one match
-            color_match = (match_count > 0)
-        else:
-            # Multiple colors detected - require matching at least 50% of them
-            required_matches = max(1, len(target_colors) // 2)
-            color_match = (match_count >= required_matches)
-        
-        # If we have sufficient color matches, include the product
-        if color_match:
-            filtered_products.append(product)
-    
-    print(f"[COLOR FILTER] Found {len(filtered_products)} products matching target colors")
-    
-    # If no products matched colors, return empty list instead of original
-    # This prevents showing irrelevant results when color was specifically requested
-    return filtered_products
-
-def get_color_variations(color: str) -> List[str]:
-    """Get variations of a color name"""
-    color_variations = {
-        "red": ["crimson", "maroon", "burgundy", "cherry", "scarlet", "ruby"],
-        "blue": ["navy", "azure", "cobalt", "sapphire", "teal", "turquoise"],
-        "green": ["emerald", "forest", "olive", "lime", "mint", "jade"],
-        "yellow": ["gold", "mustard", "amber", "lemon", "cream"],
-        "purple": ["violet", "lavender", "magenta", "plum", "lilac"],
-        "orange": ["coral", "peach", "apricot", "tangerine"],
-        "pink": ["rose", "blush", "fuchsia", "hot pink", "salmon"],
-        "brown": ["chocolate", "tan", "beige", "caramel", "coffee"],
-        "black": ["charcoal", "dark", "jet black"],
-        "white": ["ivory", "cream", "off-white", "pearl", "snow"],
-        "gray": ["grey", "silver", "charcoal", "ash", "slate"]
-    }
-    
-    return color_variations.get(color.lower(), [])
-
-# ────────────────────────────────
 # Virtual Try-On Helper Functions
 # ────────────────────────────────
 def detect_pose(image):
     """
     Detect pose landmarks from an image using MediaPipe.
     Returns keypoints for shoulders and hips.
-    Note: Requires MediaPipe to be installed.
     """
     if not MEDIAPIPE_AVAILABLE:
         raise HTTPException(
@@ -1010,6 +653,32 @@ async def index_products(products: List[dict]) -> int:
     print(f"  Success: {len(points)} | Failed: {failed}")
     return len(points)
 
+# Pydantic models
+class ProductResult(BaseModel):
+    title: str
+    image_url: str
+    price: Optional[str] = None
+    description: Optional[str] = None
+    link: str
+    similarity: float
+    source: str
+
+class CollectionItem(BaseModel):
+    image_url: str
+    collection_id: str
+    created_at: datetime
+
+class CollectionResponse(BaseModel):
+    items: List[CollectionItem]
+    total: int
+
+class SearchResponse(BaseModel):
+    results: List[ProductResult]
+    total_scraped: int
+    sources: List[str]
+    detected_category: Optional[str] = None
+    detected_attributes: Optional[dict] = None
+
 @app.post("/search", response_model=SearchResponse)
 async def search_similar_products(image: UploadFile = File(...)):
     """
@@ -1296,7 +965,6 @@ async def try_on(
 ):
     """
     Upload a human image and garment image → returns generated try-on image.
-    This endpoint allows users to virtually try on garments from their collection.
     """
     try:
         # Save temporary files
@@ -1308,7 +976,7 @@ async def try_on(
             temp_garm.write(await garment_image.read())
             garm_path = temp_garm.name
 
-        # Run virtual try-on model
+        # Run model
         output_path = process_image(human_path, garm_path)
 
         # Return final image
@@ -1325,26 +993,16 @@ async def detect_pose_api(image: UploadFile = File(...)):
     Useful for validating if the uploaded image is suitable for virtual try-on.
     Note: This endpoint requires MediaPipe (Python 3.11 or lower).
     """
-    if not MEDIAPIPE_AVAILABLE:
-        return JSONResponse(
-            content={
-                "error": "Pose detection is not available. MediaPipe requires Python 3.11 or lower.",
-                "available": False
-            }, 
-            status_code=501
-        )
-    
     try:
         img_bytes = await image.read()
         nparr = np.frombuffer(img_bytes, np.uint8)
         image_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         keypoints = detect_pose(image_cv)
-
-        return JSONResponse(content={"pose_keypoints": keypoints, "available": True})
+        return JSONResponse(content={"pose_keypoints": keypoints, "available": MEDIAPIPE_AVAILABLE})
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e), "available": MEDIAPIPE_AVAILABLE}, status_code=500)
 
 
 @app.delete("/clear-database")
