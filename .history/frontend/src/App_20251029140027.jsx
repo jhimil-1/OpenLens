@@ -1,6 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import torch
@@ -21,11 +20,6 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
-import tempfile
-import cv2
-import mediapipe as mp
-from gradio_client import Client, handle_file
-import re
 
 load_dotenv()
 
@@ -33,7 +27,7 @@ load_dotenv()
 class RateLimiter:
     def __init__(self, max_requests_per_minute: int = 100):
         self.max_requests = max_requests_per_minute
-        self.requests = defaultdict(list)
+        self.requests = defaultdict(list)  # Store timestamps by API key
         self.lock = asyncio.Lock()
     
     async def wait_if_needed(self, api_key: str):
@@ -41,15 +35,19 @@ class RateLimiter:
             now = time.time()
             minute_ago = now - 60
             
+            # Clean old requests
             self.requests[api_key] = [req_time for req_time in self.requests[api_key] if req_time > minute_ago]
             
+            # Check if we need to wait
             if len(self.requests[api_key]) >= self.max_requests:
+                # Calculate wait time until oldest request is outside the window
                 oldest_request = min(self.requests[api_key])
                 wait_time = (oldest_request + 60) - now
                 if wait_time > 0:
                     print(f"[RATE LIMIT] Waiting {wait_time:.1f}s to avoid API limits")
                     await asyncio.sleep(wait_time)
             
+            # Record this request
             self.requests[api_key].append(now)
 
 class SearchCache:
@@ -80,7 +78,7 @@ class SearchCache:
             print(f"[CACHE] Stored '{query}' page {page}")
 
 # Initialize rate limiter and cache
-rate_limiter = RateLimiter(max_requests_per_minute=90)
+rate_limiter = RateLimiter(max_requests_per_minute=90)  # Conservative limit
 search_cache = SearchCache(ttl_hours=24)
 
 class APIKeyManager:
@@ -90,15 +88,18 @@ class APIKeyManager:
         self.load_keys()
     
     def load_keys(self):
+        """Load all available API keys from environment"""
+        # Primary key
         primary_key = os.getenv("GOOGLE_API_KEY")
         if primary_key:
             self.keys.append(primary_key)
         
+        # Backup keys (can add more as needed)
         backup_keys = [
             os.getenv("GOOGLE_API_KEY_2"),
             os.getenv("GOOGLE_API_KEY_3"),
-            "AIzaSyBn8XLzv_GM18y8MLoVUkHT-F9yQIoeaH0",
-            "AIzaSyAmkVShutgc_MBRFSH43WY7o8SMqlhntsc"
+            "AIzaSyBn8XLzv_GM18y8MLoVUkHT-F9yQIoeaH0",  # Hardcoded backup
+            "AIzaSyAmkVShutgc_MBRFSH43WY7o8SMqlhntsc"   # Another backup
         ]
         
         for key in backup_keys:
@@ -108,11 +109,13 @@ class APIKeyManager:
         print(f"[API KEYS] Loaded {len(self.keys)} API keys")
     
     def get_current_key(self) -> str:
+        """Get current API key"""
         if not self.keys:
             return None
         return self.keys[self.current_index]
     
     def rotate_key(self) -> str:
+        """Rotate to next API key"""
         if not self.keys:
             return None
         
@@ -121,6 +124,7 @@ class APIKeyManager:
         return self.keys[self.current_index]
     
     def get_all_keys(self) -> List[str]:
+        """Get all available keys"""
         return self.keys.copy()
 
 # Initialize API key manager
@@ -132,12 +136,13 @@ mongo_client = AsyncIOMotorClient(MONGODB_URI)
 db_name = os.getenv("MONGODB_DB_NAME", "openlens")
 collection_name = os.getenv("MONGODB_COLLECTION_NAME", "image_collection")
 
+# Get database and collection
 db = mongo_client[db_name]
 collection_collection = db[collection_name]
 
 print(f"[MONGODB] Connected to database: {db_name}, collection: {collection_name}")
 
-app = FastAPI(title="Visual Product Search & Virtual Try-On API")
+app = FastAPI(title="Visual Product Search API")
 
 # CORS middleware
 app.add_middleware(
@@ -161,12 +166,6 @@ qdrant_client = QdrantClient(
 )
 
 COLLECTION_NAME = "product_embeddings"
-
-# Initialize MediaPipe Pose
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=True)
-mp_drawing = mp.solutions.drawing_utils
-mp_pose_landmark = mp_pose.PoseLandmark
 
 # Pydantic models
 class ProductResult(BaseModel):
@@ -197,6 +196,7 @@ class SearchResponse(BaseModel):
 # Initialize collection on startup
 @app.on_event("startup")
 async def startup_event():
+    """Create Qdrant collection if it doesn't exist"""
     try:
         collections = qdrant_client.get_collections().collections
         if not any(col.name == COLLECTION_NAME for col in collections):
@@ -210,86 +210,41 @@ async def startup_event():
     except Exception as e:
         print(f"[ERROR] Error initializing collection: {e}")
 
-# ────────────────────────────────
-# HELPER FUNCTIONS
-# ────────────────────────────────
-
-def detect_pose(image):
-    """Detect pose landmarks from an image"""
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    result = pose.process(image_rgb)
-    keypoints = {}
-
-    if result.pose_landmarks:
-        mp_drawing.draw_landmarks(image, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-        height, width, _ = image.shape
-
-        for name, index in {
-            'left_shoulder': mp_pose_landmark.LEFT_SHOULDER,
-            'right_shoulder': mp_pose_landmark.RIGHT_SHOULDER,
-            'left_hip': mp_pose_landmark.LEFT_HIP,
-            'right_hip': mp_pose_landmark.RIGHT_HIP,
-        }.items():
-            lm = result.pose_landmarks.landmark[index]
-            keypoints[name] = (int(lm.x * width), int(lm.y * height))
-
-    return keypoints
-
-
-def process_tryon_image(human_img_path: str, garm_img_path: str):
-    """Call the Gradio client (Leffa model) to perform virtual try-on."""
-    try:
-        client = Client("franciszzj/Leffa")
-
-        result = client.predict(
-            src_image_path=handle_file(human_img_path),
-            ref_image_path=handle_file(garm_img_path),
-            ref_acceleration=False,
-            step=30,
-            scale=2.5,
-            seed=42,
-            vt_model_type="viton_hd",
-            vt_garment_type="upper_body",
-            vt_repaint=False,
-            api_name="/leffa_predict_vt",
-        )
-
-        generated_image_path = result[0]
-        return generated_image_path
-    except Exception as e:
-        print(f"[ERROR] Virtual Try-On processing failed: {e}")
-        raise
-
-
 def extract_dominant_colors(image: Image.Image, num_colors: int = 3) -> List[str]:
     """Extract dominant colors from image with aggressive red detection"""
     try:
         image = image.convert("RGB")
-        image = image.resize((100, 100))
+        image = image.resize((100, 100))  # Smaller for faster processing
         
         pixels = np.array(image).reshape(-1, 3)
         
+        # Sample pixels for faster processing
         if len(pixels) > 3000:
             indices = np.random.choice(len(pixels), 3000, replace=False)
             pixels = pixels[indices]
         
+        # Aggressive red detection - check if red is dominant
         red_pixels = 0
         total_pixels = len(pixels)
         
         for pixel in pixels:
             r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
+            # Check for red-ish colors (aggressive detection)
             if r > 120 and g < 100 and b < 100:
                 red_pixels += 1
         
+        # If red constitutes more than 10% of the image, force red detection
         if red_pixels > total_pixels * 0.1:
             print(f"[COLOR DETECTION] Aggressive red detection: {red_pixels}/{total_pixels} pixels are red-ish")
             return ["red"]
         
+        # Simple k-means-like clustering for other colors
         from collections import defaultdict
         color_groups = []
         
         for pixel in pixels:
             r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
+            # Aggressive quantization to reduce variations
             r_q = (r // 60) * 60
             g_q = (g // 60) * 60
             b_q = (b // 60) * 60
@@ -311,16 +266,19 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 3) -> List[str
         
         color_groups.sort(key=lambda x: x[3], reverse=True)
         
+        # Get color names with confidence threshold
         colors = []
         for center in color_groups[:num_colors]:
             r, g, b, count = center
             confidence = count / total_pixels
             
+            # Only include colors with sufficient confidence (>5% of image)
             if confidence > 0.05:
                 color_name = get_color_name(r, g, b)
                 if color_name not in colors:
                     colors.append(color_name)
         
+        # If we detected colors, return them; otherwise return multi-color
         return colors if colors else ["multi-color"]
     except Exception as e:
         print(f"[WARNING] Color extraction error: {e}")
@@ -328,26 +286,34 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 3) -> List[str
 
 def get_color_name(r: int, g: int, b: int) -> str:
     """Convert RGB to color name with aggressive red detection"""
+    # Calculate brightness
     brightness = (r + g + b) / 3
     
+    # AGGRESSIVE RED DETECTION - Check for red-ish colors first
     if r > 120 and g < 100 and b < 100:
+        # Strong red detection
         if r > 150 and g < 80 and b < 80:
             return "red"
+        # Lighter red/orange-ish
         elif g > 60:
             return "orange"
         else:
             return "red"
     
+    # Black and white
     if brightness < 50:
         return "black"
     if brightness > 200 and abs(r - g) < 30 and abs(g - b) < 30:
         return "white"
     
+    # Calculate dominant channel
     max_val = max(r, g, b)
     
+    # Gray
     if abs(r - g) < 30 and abs(g - b) < 30 and abs(r - b) < 30:
         return "gray"
     
+    # Primary and secondary colors (only if not red-ish)
     if r > g + 30 and r > b + 30:
         if g > b + 20:
             return "orange"
@@ -367,6 +333,7 @@ def get_color_name(r: int, g: int, b: int) -> str:
     elif r > 80 and g > 60 and b < 70:
         return "brown"
     
+    # Final fallback - if still has red-ish tint, call it red
     if r > 100 and g < 90 and b < 90:
         return "red"
     
@@ -375,6 +342,7 @@ def get_color_name(r: int, g: int, b: int) -> str:
 def analyze_image_with_clip(image: Image.Image) -> dict:
     """Use CLIP to analyze the image and determine product type"""
     try:
+        # Product categories to test
         categories = [
             "headphones", "wireless headphones", "earbuds", "gaming headset",
             "smartphone", "mobile phone", "laptop", "tablet", "computer",
@@ -393,28 +361,37 @@ def analyze_image_with_clip(image: Image.Image) -> dict:
             "home decor", "lamp", "vase", "picture frame"
         ]
         
+        # Create text prompts
         text_prompts = [f"a photo of {cat}" for cat in categories]
         
+        # Encode image
         image_input = preprocess(image).unsqueeze(0).to(device)
+        
+        # Encode text
         text_tokens = tokenizer(text_prompts).to(device)
         
         with torch.no_grad():
             image_features = model.encode_image(image_input)
             text_features = model.encode_text(text_tokens)
             
+            # Normalize
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
             
+            # Calculate similarity
             similarity = (image_features @ text_features.T).squeeze(0)
             
+        # Get top 5 matches
         top5_idx = similarity.topk(5).indices.cpu().numpy()
         top5_scores = similarity.topk(5).values.cpu().numpy()
         
         detected_categories = [(categories[idx], float(score)) for idx, score in zip(top5_idx, top5_scores)]
         
+        # Get primary category
         primary_category = detected_categories[0][0]
         confidence = detected_categories[0][1]
         
+        # Determine broader category
         broad_category = categorize_product(primary_category)
         
         return {
@@ -484,31 +461,41 @@ def filter_products_by_color(products: List[dict], target_colors: List[str]) -> 
         description = product.get('description', '').lower()
         combined_text = f"{title} {description}"
         
+        # Check if any target color appears in the product text
         color_match = False
         match_count = 0
         
         for target_color in target_colors:
+            # Check for exact color match
             if target_color in combined_text:
                 match_count += 1
                 continue
             
+            # Check for color variations (e.g., "red" matches "crimson", "maroon")
             color_variations = get_color_variations(target_color)
             for variation in color_variations:
                 if variation in combined_text:
                     match_count += 1
                     break
         
+        # STRICT FILTERING: Only include if we match ALL detected colors
+        # This prevents white dresses from appearing when searching for red
         if len(target_colors) == 1:
+            # Single color search - require at least one match
             color_match = (match_count > 0)
         else:
+            # Multiple colors detected - require matching at least 50% of them
             required_matches = max(1, len(target_colors) // 2)
             color_match = (match_count >= required_matches)
         
+        # If we have sufficient color matches, include the product
         if color_match:
             filtered_products.append(product)
     
     print(f"[COLOR FILTER] Found {len(filtered_products)} products matching target colors")
     
+    # If no products matched colors, return empty list instead of original
+    # This prevents showing irrelevant results when color was specifically requested
     return filtered_products
 
 def get_color_variations(color: str) -> List[str]:
@@ -530,9 +517,12 @@ def get_color_variations(color: str) -> List[str]:
     return color_variations.get(color.lower(), [])
 
 async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries: int = 3) -> List[dict]:
-    """Fetch products from Google Custom Search API with rate limiting, caching, and retry logic"""
+    """
+    Fetch products from Google Custom Search API with rate limiting, caching, and retry logic
+    """
     print(f"[SEARCH] Searching: '{query}' (page {page})")
     
+    # Check cache first
     cached_result = await search_cache.get(query, page)
     if cached_result is not None:
         return cached_result
@@ -544,13 +534,16 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
         print("[ERROR] No Google API key available")
         return products
     
+    # Apply rate limiting
     await rate_limiter.wait_if_needed(api_key)
     
     try:
         url = "https://www.googleapis.com/customsearch/v1"
         
+        # Calculate start index for pagination
         start_index = ((page - 1) * 10) + 1
         
+        # Enhanced search parameters for better product discovery
         params = {
             "q": query,
             "key": api_key,
@@ -562,10 +555,12 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
             "safe": "active",
             "fileType": "jpg,png",
             "imgType": "photo",
-            "sort": "date",
-            "dateRestrict": "m6"
+            # Add additional parameters for better product search
+            "sort": "date",  # Prefer recent results
+            "dateRestrict": "m6"  # Results from last 6 months
         }
         
+        # Add site-specific searches for better platform coverage
         site_specific_queries = []
         if "flipkart" in query.lower():
             site_specific_queries.append(f"site:flipkart.com {query.replace('Flipkart', '').strip()}")
@@ -578,16 +573,18 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
         if "ajio" in query.lower():
             site_specific_queries.append(f"site:ajio.com {query.replace('Ajio', '').strip()}")
         
+        # Try multiple search variations for better coverage
         search_variations = [query] + site_specific_queries
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             for search_query in search_variations:
-                if len(products) >= 10:
+                if len(products) >= 10:  # Limit per variation
                     break
                 
                 current_params = params.copy()
                 current_params["q"] = search_query
                 
+                # Implement exponential backoff for retries
                 for attempt in range(max_retries):
                     try:
                         response = await client.get(url, params=current_params)
@@ -598,7 +595,7 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
                             if data.get('items'):
                                 for item in data['items']:
                                     try:
-                                        if len(products) >= 10:
+                                        if len(products) >= 10:  # Limit per variation
                                             break
                                             
                                         title = item.get('title', 'Product')
@@ -607,14 +604,19 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
                                         if not image_url:
                                             continue
                                         
+                                        # Skip low-quality images
                                         if any(skip_term in image_url.lower() for skip_term in ['placeholder', 'no-image', 'default']):
                                             continue
                                         
+                                        # Get context
                                         context = item.get('image', {})
                                         link = context.get('contextLink', image_url)
                                         snippet = item.get('snippet', title)
                                         
+                                        # Try to extract price from snippet or title
                                         price = extract_price_from_text(f"{title} {snippet}")
+                                        
+                                        # Detect actual source from URL
                                         source = detect_source_from_url(link)
                                         
                                         product = {
@@ -632,24 +634,28 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
                                         continue
                                 
                                 print(f"  [OK] Found {len(products)} products from '{search_query}'")
-                                break
+                                break  # Success, move to next variation
                                 
                             else:
                                 print(f"  [INFO] No items for '{search_query}'")
                                 break
                                 
                         elif response.status_code == 429:
+                            # Rate limit hit - try rotating API key first
                             print(f"  [RATE LIMIT] Hit rate limit for current API key")
                             
+                            # Try to rotate to next API key
                             new_key = api_key_manager.rotate_key()
                             if new_key and new_key != api_key:
                                 api_key = new_key
                                 current_params["key"] = api_key
                                 print(f"  [RATE LIMIT] Rotated to new API key, retrying...")
+                                # Apply rate limiting for new key
                                 await rate_limiter.wait_if_needed(api_key)
                                 continue
                             else:
-                                wait_time = (2 ** attempt) + (0.5 * attempt)
+                                # No more keys available, implement exponential backoff
+                                wait_time = (2 ** attempt) + (0.5 * attempt)  # 1s, 3s, 7s
                                 print(f"  [RATE LIMIT] No more API keys, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})")
                                 await asyncio.sleep(wait_time)
                             
@@ -660,13 +666,15 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
                     except Exception as e:
                         print(f"  [ERROR] Request failed: {e} (attempt {attempt + 1}/{max_retries})")
                         if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
+                            await asyncio.sleep(2 ** attempt)  # Exponential backoff
                         else:
                             break
                 
+                # Delay between search variations to avoid overwhelming the API
                 if search_variations.index(search_query) < len(search_variations) - 1:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(1.0)  # Increased delay
                     
+        # Cache the results
         await search_cache.set(query, page, products)
         
     except Exception as e:
@@ -677,6 +685,9 @@ async def fetch_from_google_custom_search(query: str, page: int = 1, max_retries
 
 def extract_price_from_text(text: str) -> str:
     """Extract price from text"""
+    import re
+    
+    # Look for price patterns
     price_patterns = [
         r'\$\s*\d+\.?\d*',
         r'₹\s*\d+\.?\d*',
@@ -694,10 +705,11 @@ def extract_price_from_text(text: str) -> str:
 
 def clean_title(title: str) -> str:
     """Clean product title"""
+    # Remove common noise
     noise_patterns = [
-        r'\|\s*.*$',
-        r'\-\s*.*$',
-        r'\d{3,}x\d{3,}',
+        r'\|\s*.*$',  # Remove everything after |
+        r'\-\s*.*$',  # Remove everything after -
+        r'\d{3,}x\d{3,}',  # Remove image dimensions
     ]
     
     for pattern in noise_patterns:
@@ -712,6 +724,7 @@ def detect_source_from_url(url: str) -> str:
     
     url_lower = url.lower()
     
+    # Platform detection based on domain
     if 'amazon.' in url_lower:
         return 'Amazon'
     elif 'flipkart.' in url_lower:
@@ -757,6 +770,7 @@ def detect_source_from_url(url: str) -> str:
     elif 'google.' in url_lower and ('shopping' in url_lower or 'products' in url_lower):
         return 'Google Shopping'
     else:
+        # Try to extract domain name for unknown sources
         try:
             from urllib.parse import urlparse
             parsed = urlparse(url)
@@ -775,15 +789,18 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
     
     queries = []
     
+    # Add primary category queries
     queries.append(f"{primary_category} product")
     queries.append(f"{primary_category} buy online")
     queries.append(f"{primary_category} shopping")
     
+    # Add color variations
     for color in colors[:2]:
         if color not in ["multi-color", "mixed"]:
             queries.append(f"{color} {primary_category}")
             queries.append(f"{primary_category} {color}")
     
+    # Add platform-specific queries for major e-commerce sites
     platform_queries = [
         f"{primary_category} Amazon",
         f"{primary_category} Flipkart",
@@ -798,6 +815,7 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
         f"{primary_category} Vijay Sales"
     ]
     
+    # Add category-specific queries
     if broad_category == "electronics":
         queries.extend([
             f"{primary_category} Best Buy",
@@ -806,6 +824,7 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
             f"{primary_category} tech",
             f"{primary_category} gadget"
         ])
+        # Add electronics-specific platforms
         platform_queries.extend([
             f"{primary_category} electronic store",
             f"{primary_category} tech store"
@@ -817,6 +836,7 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
             f"{primary_category} clothing",
             f"{primary_category} apparel"
         ])
+        # Add fashion-specific platforms
         platform_queries.extend([
             f"{primary_category} fashion store",
             f"{primary_category} boutique"
@@ -829,11 +849,13 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
             f"{primary_category} collection"
         ])
     
+    # Add platform-specific queries (shuffle to avoid bias)
     import random
     shuffled_platforms = platform_queries.copy()
     random.shuffle(shuffled_platforms)
     queries.extend(shuffled_platforms)
     
+    # Add generic shopping queries
     queries.extend([
         f"{primary_category} 2024",
         f"best {primary_category}",
@@ -845,6 +867,7 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
         f"{primary_category} offer"
     ])
     
+    # Remove duplicates and limit
     seen = set()
     unique_queries = []
     for query in queries:
@@ -852,7 +875,7 @@ def generate_search_queries(category_info: dict, colors: List[str], broad_catego
             seen.add(query.lower())
             unique_queries.append(query)
     
-    return unique_queries[:20]
+    return unique_queries[:20]  # Increased limit to 20 for more variety
 
 async def index_products(products: List[dict]) -> int:
     """Index products in Qdrant with CLIP embeddings"""
@@ -866,10 +889,13 @@ async def index_products(products: List[dict]) -> int:
                 if (idx + 1) % 5 == 0:
                     print(f"  Processing {idx+1}/{len(products)}...")
                 
+                # Download image
                 response = await client.get(product["image_url"])
                 if response.status_code == 200:
+                    # Extract embedding
                     embedding = extract_clip_embedding(response.content)
                     
+                    # Create point
                     point = PointStruct(
                         id=str(uuid.uuid4()),
                         vector=embedding,
@@ -881,12 +907,13 @@ async def index_products(products: List[dict]) -> int:
                     
             except Exception as e:
                 failed += 1
-                if idx < 5:
+                if idx < 5:  # Only print first few errors
                     print(f"  [WARNING] Error on product {idx+1}: {str(e)[:50]}")
                 continue
     
     if points:
         print(f"  Uploading {len(points)} vectors to Qdrant...")
+        # Upload in batches
         batch_size = 50
         for i in range(0, len(points), batch_size):
             batch = points[i:i+batch_size]
@@ -899,14 +926,13 @@ async def index_products(products: List[dict]) -> int:
     print(f"  Success: {len(points)} | Failed: {failed}")
     return len(points)
 
-# ────────────────────────────────
-# PRODUCT SEARCH ENDPOINTS
-# ────────────────────────────────
-
 @app.post("/search", response_model=SearchResponse)
 async def search_similar_products(image: UploadFile = File(...)):
-    """Upload an image and find visually similar products"""
+    """
+    Upload an image and find visually similar products
+    """
     try:
+        # Clear existing database
         try:
             qdrant_client.delete_collection(COLLECTION_NAME)
             qdrant_client.create_collection(
@@ -917,14 +943,17 @@ async def search_similar_products(image: UploadFile = File(...)):
         except Exception as e:
             print(f"[WARNING] Database clear error: {e}")
         
+        # Read image
         image_bytes = await image.read()
         
         print("\n" + "="*70)
         print("[VISUAL PRODUCT SEARCH]")
         print("="*70)
         
+        # Open image
         img = Image.open(io.BytesIO(image_bytes))
         
+        # Step 1: Analyze image with CLIP
         print("\n[ANALYZE] Analyzing image with CLIP...")
         category_info = analyze_image_with_clip(img)
         colors = extract_dominant_colors(img)
@@ -937,6 +966,7 @@ async def search_similar_products(image: UploadFile = File(...)):
         if len(category_info['top_matches']) > 1:
             print(f"  Also matches: {', '.join([m[0] for m in category_info['top_matches'][1:3]])}")
         
+        # Step 2: Generate search queries
         print(f"\n[QUERY] Generating search queries...")
         search_queries = generate_search_queries(
             category_info, 
@@ -945,6 +975,7 @@ async def search_similar_products(image: UploadFile = File(...)):
         )
         print(f"  Generated {len(search_queries)} queries")
         
+        # Step 3: Search Google
         print(f"\n[GOOGLE] Searching Google Custom Search API...")
         all_products = []
         max_products = 100
@@ -953,6 +984,7 @@ async def search_similar_products(image: UploadFile = File(...)):
             if len(all_products) >= max_products:
                 break
             
+            # Search with pagination (2 pages per query)
             for page in [1, 2]:
                 if len(all_products) >= max_products:
                     break
@@ -960,9 +992,11 @@ async def search_similar_products(image: UploadFile = File(...)):
                 products = await fetch_from_google_custom_search(query, page)
                 all_products.extend(products)
                 
+                # Rate limit protection
                 if page == 1 and products:
                     await asyncio.sleep(0.5)
         
+        # Remove duplicates
         seen_urls = set()
         unique_products = []
         for product in all_products:
@@ -979,6 +1013,7 @@ async def search_similar_products(image: UploadFile = File(...)):
                 detail="No products found. Please check your Google Custom Search API configuration."
             )
         
+        # Step 4: Index products
         query_embedding = extract_clip_embedding(image_bytes)
         indexed_count = await index_products(unique_products)
         
@@ -988,6 +1023,7 @@ async def search_similar_products(image: UploadFile = File(...)):
                 detail="Failed to index products"
             )
         
+        # Step 5: Find similar products
         print(f"\n[MATCH] Finding visually similar products...")
         search_results = qdrant_client.search(
             collection_name=COLLECTION_NAME,
@@ -995,8 +1031,10 @@ async def search_similar_products(image: UploadFile = File(...)):
             limit=30
         )
         
+        # Filter and rank results
         print(f"  Found {len(search_results)} candidates")
         
+        # Dynamic threshold based on category
         min_threshold = 0.60 if category_info['broad_category'] == 'electronics' else 0.65
         
         filtered_results = []
@@ -1014,13 +1052,17 @@ async def search_similar_products(image: UploadFile = File(...)):
         
         print(f"  Filtered to {len(filtered_results)} high-quality matches")
         
+        # Apply color filtering if colors were detected
         if colors:
             print(f"[COLOR] Applying color filter for: {colors}")
+            # Convert filtered results to products list for color filtering
             products_for_color_filter = [hit.payload for hit in filtered_results]
             color_filtered_products = filter_products_by_color(products_for_color_filter, colors)
             
+            # Create a mapping of products that passed color filter
             color_filtered_urls = {product['image_url'] for product in color_filtered_products}
             
+            # Filter the original search results based on color filtering
             final_filtered_results = []
             for hit in filtered_results:
                 if hit.payload['image_url'] in color_filtered_urls:
@@ -1028,9 +1070,11 @@ async def search_similar_products(image: UploadFile = File(...)):
             
             print(f"[COLOR] After color filtering: {len(final_filtered_results)} products")
             
+            # If we have color-filtered results, use them; otherwise keep original
             if final_filtered_results:
                 filtered_results = final_filtered_results
         
+        # Format results
         results = []
         sources = set()
         
@@ -1082,14 +1126,12 @@ async def health_check():
         "apis_configured": ["Google Custom Search API"] if os.getenv("GOOGLE_API_KEY") else [],
     }
 
-# ────────────────────────────────
-# COLLECTION ENDPOINTS
-# ────────────────────────────────
-
+# Collection endpoints
 @app.post("/collection/add")
 async def add_to_collection(image_url: str, user_id: str = "anonymous"):
     """Add an image to user's collection"""
     try:
+        # Check if image already exists in collection
         existing = await collection_collection.find_one({
             "user_id": user_id,
             "image_url": image_url
@@ -1098,6 +1140,7 @@ async def add_to_collection(image_url: str, user_id: str = "anonymous"):
         if existing:
             return {"message": "Image already in collection", "collection_id": str(existing["_id"])}
         
+        # Add new collection item
         collection_item = {
             "user_id": user_id,
             "image_url": image_url,
@@ -1158,166 +1201,6 @@ async def clear_user_collection(user_id: str = "anonymous"):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear collection: {str(e)}")
 
-# ────────────────────────────────
-# VIRTUAL TRY-ON ENDPOINTS
-# ────────────────────────────────
-
-@app.post("/api/tryon")
-async def try_on(
-    human_image: UploadFile = File(...),
-    garment_image: UploadFile = File(...),
-):
-    """
-    Upload a human image and garment image → returns generated try-on image.
-    
-    Parameters:
-    - human_image: Image of the person
-    - garment_image: Image of the clothing item to try on
-    
-    Returns:
-    - PNG image with the person wearing the garment
-    """
-    temp_human_path = None
-    temp_garm_path = None
-    
-    try:
-        print("\n[TRYON] Starting virtual try-on process...")
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_human:
-            temp_human.write(await human_image.read())
-            temp_human_path = temp_human.name
-            print(f"  Saved human image: {temp_human_path}")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_garm:
-            temp_garm.write(await garment_image.read())
-            temp_garm_path = temp_garm.name
-            print(f"  Saved garment image: {temp_garm_path}")
-
-        print("  Processing with Leffa model...")
-        output_path = process_tryon_image(temp_human_path, temp_garm_path)
-        
-        print(f"  [OK] Try-on complete: {output_path}")
-        
-        return FileResponse(output_path, media_type="image/png")
-
-    except Exception as e:
-        print(f"  [ERROR] Try-on failed: {str(e)}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    
-    finally:
-        if temp_human_path and os.path.exists(temp_human_path):
-            try:
-                os.unlink(temp_human_path)
-            except:
-                pass
-        if temp_garm_path and os.path.exists(temp_garm_path):
-            try:
-                os.unlink(temp_garm_path)
-            except:
-                pass
-
-
-@app.post("/api/tryon/from-collection")
-async def try_on_from_collection(
-    human_image: UploadFile = File(...),
-    garment_url: str = Form(...),
-    user_id: str = Form("anonymous")
-):
-    """
-    Try on a garment from the user's collection or from a URL.
-    
-    Parameters:
-    - human_image: Image of the person
-    - garment_url: URL of the garment image from collection
-    - user_id: User identifier
-    
-    Returns:
-    - PNG image with the person wearing the garment
-    """
-    temp_human_path = None
-    temp_garm_path = None
-    
-    try:
-        print("\n[TRYON] Starting try-on from collection...")
-        
-        if not garment_url:
-            raise HTTPException(status_code=400, detail="garment_url is required")
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_human:
-            temp_human.write(await human_image.read())
-            temp_human_path = temp_human.name
-            print(f"  Saved human image: {temp_human_path}")
-        
-        print(f"  Downloading garment from: {garment_url}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(garment_url)
-            if response.status_code != 200:
-                raise HTTPException(status_code=400, detail="Failed to download garment image")
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_garm:
-                temp_garm.write(response.content)
-                temp_garm_path = temp_garm.name
-                print(f"  Saved garment image: {temp_garm_path}")
-        
-        print("  Processing with Leffa model...")
-        output_path = process_tryon_image(temp_human_path, temp_garm_path)
-        
-        print(f"  [OK] Try-on complete: {output_path}")
-        
-        return FileResponse(output_path, media_type="image/png")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"  [ERROR] Try-on failed: {str(e)}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    
-    finally:
-        if temp_human_path and os.path.exists(temp_human_path):
-            try:
-                os.unlink(temp_human_path)
-            except:
-                pass
-        if temp_garm_path and os.path.exists(temp_garm_path):
-            try:
-                os.unlink(temp_garm_path)
-            except:
-                pass
-
-
-@app.post("/api/detect_pose")
-async def detect_pose_api(image: UploadFile = File(...)):
-    """
-    Detect and return pose keypoints from a human image.
-    
-    Parameters:
-    - image: Image of the person
-    
-    Returns:
-    - JSON with pose keypoints (shoulders, hips)
-    """
-    try:
-        print("\n[POSE] Detecting pose landmarks...")
-        
-        img_bytes = await image.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        image_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        keypoints = detect_pose(image_cv)
-        
-        print(f"  [OK] Detected {len(keypoints)} keypoints")
-
-        return JSONResponse(content={"pose_keypoints": keypoints})
-
-    except Exception as e:
-        print(f"  [ERROR] Pose detection failed: {str(e)}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-# ────────────────────────────────
-# DATABASE MANAGEMENT
-# ────────────────────────────────
-
 @app.delete("/clear-database")
 async def clear_database():
     """Clear all vectors from Qdrant"""
@@ -1331,27 +1214,7 @@ async def clear_database():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Welcome to Visual Product Search & Virtual Try-On API 🛍️👗",
-        "version": "1.0",
-        "endpoints": {
-            "product_search": "/search",
-            "virtual_tryon": "/api/tryon",
-            "tryon_from_collection": "/api/tryon/from-collection",
-            "pose_detection": "/api/detect_pose",
-            "collection": {
-                "add": "/collection/add",
-                "list": "/collection/list",
-                "remove": "/collection/remove/{id}",
-                "clear": "/collection/clear"
-            },
-            "health": "/health"
-        }
-    }
-
 if __name__ == "__main__":
     import uvicorn
+    import re
     uvicorn.run(app, host="0.0.0.0", port=8003, log_level="info")

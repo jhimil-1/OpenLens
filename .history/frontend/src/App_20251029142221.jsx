@@ -207,19 +207,21 @@ export default function VisualProductSearch() {
     try {
       const formData = new FormData();
       formData.append('human_image', humanImage);
-      formData.append('garment_url', selectedGarment);
+      
+      // Fetch garment image and add to form
+      const garmentResponse = await fetch(selectedGarment);
+      const garmentBlob = await garmentResponse.blob();
+      formData.append('garment_image', garmentBlob, 'garment.png');
 
-      const response = await fetch('http://localhost:8003/api/tryon/from-collection', {
+      const response = await fetch(`${API_BASE_URL}/api/tryon`, {
         method: 'POST',
         body: formData,
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || `Try-on failed: ${response.statusText}`);
+        throw new Error(`Try-on failed: ${response.statusText}`);
       }
 
-      // Convert response to blob and create object URL
       const resultBlob = await response.blob();
       const resultUrl = URL.createObjectURL(resultBlob);
       setTryOnResult(resultUrl);

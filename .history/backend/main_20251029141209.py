@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -1220,8 +1220,8 @@ async def try_on(
 @app.post("/api/tryon/from-collection")
 async def try_on_from_collection(
     human_image: UploadFile = File(...),
-    garment_url: str = Form(...),
-    user_id: str = Form("anonymous")
+    garment_url: str = None,
+    user_id: str = "anonymous"
 ):
     """
     Try on a garment from the user's collection or from a URL.

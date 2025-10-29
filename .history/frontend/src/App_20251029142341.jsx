@@ -215,11 +215,9 @@ export default function VisualProductSearch() {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || `Try-on failed: ${response.statusText}`);
+        throw new Error(`Try-on failed: ${response.statusText}`);
       }
 
-      // Convert response to blob and create object URL
       const resultBlob = await response.blob();
       const resultUrl = URL.createObjectURL(resultBlob);
       setTryOnResult(resultUrl);
