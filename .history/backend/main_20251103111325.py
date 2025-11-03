@@ -331,19 +331,6 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
         hue = H[keep]
         sat = S[keep]
         val = V[keep]
-
-        # NEW: Strong achromatic prioritization (avoid small chromatic accents dominating)
-        very_dark = val < 0.25
-        low_sat = sat < 0.22
-        achromatic_dark_ratio = float(np.mean(very_dark & low_sat)) if hue.size > 0 else 0.0
-        if hue.size > 0 and achromatic_dark_ratio > 0.50:
-            return ["black"]
-
-        # NEW: If majority very bright and low-saturation, treat as pure white
-        very_bright = val > 0.96
-        achromatic_bright_ratio = float(np.mean(very_bright & low_sat)) if hue.size > 0 else 0.0
-        if hue.size > 0 and achromatic_bright_ratio > 0.50:
-            return ["white"]
         
         # ENHANCED: Weight by saturation and value to prioritize vivid colors
         weights = sat * val
@@ -388,17 +375,13 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
                 colors.append(name)
                 seen_hue_ranges.add(hue_group)
 
-        # ENHANCED: Stricter red safeguard with purity check (avoid small red accents dominating)
-        if 'red' in colors:
-            # Require red to be both saturated and not too dark (avoid near-black red)
-            red_pixels = ((hue < 8) | (hue >= 172)) & (sat > 0.38) & (val > 0.30)
-            red_ratio = float(red_pixels.sum()) / max(1, len(hue))
-            # If red clearly dominant, allow it. Otherwise, prefer achromatics when present.
-            if red_ratio > 0.45 and colors[0] != 'red':
+        # ENHANCED: Stricter red safeguard with purity check
+        if 'red' in colors and colors[0] != 'red':
+            # Check if red is truly dominant
+            red_pixels = ((hue < 8) | (hue >= 172)) & (sat > 0.35)
+            if red_pixels.sum() > len(hue) * 0.25:  # At least 25% red pixels
                 colors.remove('red')
                 colors.insert(0, 'red')
-            elif red_ratio < 0.25 and 'black' in colors:
-                colors = ['black'] + [c for c in colors if c not in ('black', 'red')]
 
         return colors if colors else ["multi-color"]
     except Exception as e:
@@ -528,6 +511,7 @@ def analyze_image_with_clip(image: Image.Image) -> dict:
             "women's jeans", "women's pants", "women's trousers", "women's leggings", "women's yoga pants",
             "women's jacket", "women's coat", "women's sweater", "women's hoodie", "women's cardigan",
             "women's shorts", "women's jumpsuit", "women's romper", "women's bikini",
+            "women's handbag", "women's purse", "women's heels", "women's sandals",
             
             # Men's clothing  
             "men's shirt", "men's t-shirt", "men's polo shirt", "men's formal shirt",
@@ -705,34 +689,6 @@ def calculate_color_similarity(target_colors: List[str], text: str) -> float:
     
     return match_score
 
-def is_color_match_strict(target_colors: List[str], candidate_colors: List[str]) -> bool:
-    """Strict color equality with special handling for black/white.
-    - If no target or candidate colors, return True (do not over-filter).
-    - Require target primary color to be present in candidate colors.
-    - If target is black, reject if candidate contains strong chromatic colors (e.g., red, blue, green, yellow, orange, pink, purple, cyan) besides black/gray/white.
-    - If target is white, similarly reject if candidate contains strong chromatic colors.
-    """
-    if not target_colors:
-        return True
-    if candidate_colors is None:
-        candidate_colors = []
-
-    target_primary = target_colors[0].lower()
-    candidate_set = {c.lower() for c in candidate_colors if isinstance(c, str)}
-
-    if target_primary not in candidate_set:
-        return False
-
-    strong_colors = {"red", "blue", "green", "yellow", "orange", "pink", "purple", "cyan"}
-    if target_primary == "black":
-        # Allow only achromatic companions
-        if any(c in strong_colors for c in candidate_set):
-            return False
-    if target_primary == "white":
-        if any(c in strong_colors for c in candidate_set):
-            return False
-    return True
-
 def filter_products_by_attributes(products: List[dict], target_colors: List[str], gender: str, category: str) -> List[dict]:
     """ENHANCED: Filter products with STRICT color matching"""
     if not products:
@@ -747,18 +703,11 @@ def filter_products_by_attributes(products: List[dict], target_colors: List[str]
         description = product.get('description', '').lower()
         combined_text = f"{title} {description}"
         
-        # Prefer strict image-based color check if available
-        product_colors = product.get('dominant_colors', [])
-        color_match = True
-        color_score = 1.0
-        if target_colors and target_colors != ["multi-color"]:
-            if product_colors:
-                color_match = is_color_match_strict(target_colors, product_colors)
-                color_score = 1.0 if color_match else 0.0
-            else:
-                # Fallback to text similarity
-                color_score = calculate_color_similarity(target_colors, combined_text)
-                color_match = color_score >= 0.8
+        # ENHANCED: Strict color matching with similarity scoring
+        color_score = calculate_color_similarity(target_colors, combined_text)
+        
+        # ENHANCED: Stricter threshold - require at least 80% color match
+        color_match = color_score >= 0.8
         
         if not color_match and target_colors and target_colors != ["multi-color"]:
             print(f"    [COLOR FILTER] Rejected: '{title[:50]}' (score: {color_score:.2f})")
@@ -982,8 +931,8 @@ def extract_price_from_text(text: str) -> str:
 def clean_title(title: str) -> str:
     """Clean product title"""
     noise_patterns = [
-        r'\|\s*.*$',
-        r'\-\s*.*$',
+        r'\|\s*.*',
+        r'\-\s*.*',
         r'\d{3,}x\d{3,}',
     ]
     
@@ -1095,14 +1044,6 @@ async def index_products(products: List[dict]) -> int:
                 response = await client.get(product["image_url"])
                 if response.status_code == 200:
                     embedding = extract_clip_embedding(response.content)
-
-                    # Compute image-based dominant colors for strict filtering later
-                    try:
-                        img_for_color = Image.open(io.BytesIO(response.content)).convert("RGB")
-                        dom_colors = extract_dominant_colors(img_for_color, num_colors=2)
-                        product["dominant_colors"] = dom_colors
-                    except Exception as _e:
-                        product["dominant_colors"] = []
                     
                     point = PointStruct(
                         id=str(uuid.uuid4()),
@@ -1248,7 +1189,7 @@ async def search_similar_products(image: UploadFile = File(...)):
         elif category_info['broad_category'] == 'electronics':
             min_threshold = 0.60
         
-        # ENHANCED: Apply color-based re-scoring + strict color gate
+        # ENHANCED: Apply color-based re-scoring
         filtered_results = []
         seen_titles = set()
         
@@ -1261,17 +1202,7 @@ async def search_similar_products(image: UploadFile = File(...)):
             description = hit.payload.get('description', '')
             combined_text = f"{title} {description}".lower()
             
-            # Prefer image-based dominant colors stored in payload
-            payload_colors = hit.payload.get('dominant_colors') if isinstance(hit.payload, dict) else None
-            strict_ok = is_color_match_strict(colors, payload_colors or []) if colors and colors != ["multi-color"] else True
-            if not strict_ok and colors and colors != ["multi-color"]:
-                continue
-
-            color_match_score = 1.0 if strict_ok else calculate_color_similarity(colors, combined_text)
-            
-            # Strict color gate at result-time as well
-            if colors and colors != ["multi-color"] and color_match_score < 0.8:
-                continue
+            color_match_score = calculate_color_similarity(colors, combined_text)
             
             # ENHANCED: Boost similarity score based on color match
             adjusted_similarity = hit.score * (0.7 + 0.3 * color_match_score)

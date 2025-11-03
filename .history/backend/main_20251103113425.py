@@ -261,7 +261,7 @@ def process_tryon_image(human_img_path: str, garm_img_path: str):
 
 def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str]:
     """Extract garment colors using HSV with central focus and background suppression.
-    ENHANCED: More precise color detection to avoid cross-color contamination.
+    ENHANCED: More precise color detection with improved black/white detection.
     """
     try:
         image = image.convert("RGB")
@@ -273,7 +273,7 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
         # Central ellipse mask → prioritize the garment region
         yy, xx = np.ogrid[:h, :w]
         cy, cx = h / 2.0, w / 2.0
-        ry, rx = h * 0.35, w * 0.35
+        ry, rx = h * 0.40, w * 0.40  # Slightly larger mask
         center_mask = (((yy - cy) ** 2) / (ry ** 2) + ((xx - cx) ** 2) / (rx ** 2)) <= 1.0
 
         # HSV conversion
@@ -293,59 +293,105 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
         S = hsv[:, :, 1] / 255.0
         V = hsv[:, :, 2] / 255.0
 
-        # ENHANCED: More strict dark/bright detection
-        center_V = V[center_mask]
-        if center_V.size > 0:
-            dark_ratio = float(np.mean(center_V < 0.15))  # More strict threshold
-            bright_ratio = float(np.mean(center_V > 0.93))  # More strict threshold
-            if dark_ratio > 0.60:  # Increased threshold
+        # FIRST: Check the entire image for black/white dominance
+        all_V = V.flatten()
+        all_S = S.flatten()
+        
+        # Calculate average brightness and saturation
+        avg_brightness = float(np.mean(all_V))
+        avg_saturation = float(np.mean(all_S))
+        
+        print(f"  [COLOR DEBUG] Avg brightness: {avg_brightness:.3f}, Avg saturation: {avg_saturation:.3f}")
+        
+        # ENHANCED: Black detection (low brightness + low saturation)
+        if avg_brightness < 0.25 and avg_saturation < 0.25:
+            dark_pixel_ratio = float(np.mean(all_V < 0.30))
+            print(f"  [COLOR DEBUG] Dark pixel ratio: {dark_pixel_ratio:.3f}")
+            if dark_pixel_ratio > 0.65:
+                print(f"  [COLOR DEBUG] Detected BLACK (low brightness + low saturation)")
                 return ["black"]
-            if bright_ratio > 0.60:  # Increased threshold
+        
+        # ENHANCED: White detection (high brightness + low saturation)
+        if avg_brightness > 0.80 and avg_saturation < 0.25:
+            bright_pixel_ratio = float(np.mean(all_V > 0.85))
+            print(f"  [COLOR DEBUG] Bright pixel ratio: {bright_pixel_ratio:.3f}")
+            if bright_pixel_ratio > 0.65:
+                print(f"  [COLOR DEBUG] Detected WHITE (high brightness + low saturation)")
                 return ["white"]
+        
+        # Check center region for black/white
+        center_V = V[center_mask]
+        center_S = S[center_mask]
+        
+        if center_V.size > 0:
+            center_avg_brightness = float(np.mean(center_V))
+            center_avg_saturation = float(np.mean(center_S))
+            
+            print(f"  [COLOR DEBUG] Center avg brightness: {center_avg_brightness:.3f}, saturation: {center_avg_saturation:.3f}")
+            
+            # Black detection in center
+            if center_avg_brightness < 0.28 and center_avg_saturation < 0.30:
+                dark_ratio = float(np.mean(center_V < 0.32))
+                if dark_ratio > 0.55:
+                    print(f"  [COLOR DEBUG] Detected BLACK in center region")
+                    return ["black"]
+            
+            # White detection in center
+            if center_avg_brightness > 0.85 and center_avg_saturation < 0.25:
+                bright_ratio = float(np.mean(center_V > 0.88))
+                if bright_ratio > 0.55:
+                    print(f"  [COLOR DEBUG] Detected WHITE in center region")
+                    return ["white"]
 
-        # ENHANCED: Stricter saturation and value masks
-        sat_mask = S > 0.32  # Increased from 0.28
-        val_mask = (V > 0.15) & (V < 0.90)  # Stricter range
+        # Gray detection (medium brightness + very low saturation)
+        if 0.25 < avg_brightness < 0.75 and avg_saturation < 0.15:
+            gray_pixel_ratio = float(np.mean((all_V > 0.25) & (all_V < 0.75) & (all_S < 0.15)))
+            if gray_pixel_ratio > 0.60:
+                print(f"  [COLOR DEBUG] Detected GRAY (medium brightness + very low saturation)")
+                return ["gray"]
+
+        # Now proceed with chromatic color detection
+        # ENHANCED: Only consider saturated pixels for chromatic colors
+        sat_mask = S > 0.25  # Saturated pixels only
+        val_mask = (V > 0.20) & (V < 0.85)  # Exclude very dark and very bright
         keep = center_mask & sat_mask & val_mask
 
         if not keep.any():
+            # Try without center mask
             keep = sat_mask & val_mask
+        
         if not keep.any():
-            global_dark = float(np.mean(V < 0.15))
-            global_bright = float(np.mean(V > 0.93))
-            if global_dark > 0.60:
+            # No chromatic colors found, determine based on brightness
+            if avg_brightness < 0.35:
+                print(f"  [COLOR DEBUG] No chromatic colors, defaulting to BLACK")
                 return ["black"]
-            if global_bright > 0.60:
+            elif avg_brightness > 0.75:
+                print(f"  [COLOR DEBUG] No chromatic colors, defaulting to WHITE")
                 return ["white"]
-            return ["multi-color"]
+            else:
+                print(f"  [COLOR DEBUG] No chromatic colors, defaulting to GRAY")
+                return ["gray"]
 
-        # ENHANCED: More aggressive background removal
+        # Remove background
         border = np.concatenate([img[0, :, :], img[-1, :, :], img[:, 0, :], img[:, -1, :]], axis=0)
         bg_mean = border.mean(axis=0)
         dist_bg = np.sqrt(((img - bg_mean) ** 2).sum(axis=2))
-        keep = keep & (dist_bg > 45.0)  # Increased from 35.0
+        keep = keep & (dist_bg > 40.0)
 
         if not keep.any():
-            return ["multi-color"]
+            # Fallback based on brightness
+            if avg_brightness < 0.35:
+                return ["black"]
+            elif avg_brightness > 0.75:
+                return ["white"]
+            else:
+                return ["gray"]
 
         hue = H[keep]
         sat = S[keep]
         val = V[keep]
-
-        # NEW: Strong achromatic prioritization (avoid small chromatic accents dominating)
-        very_dark = val < 0.25
-        low_sat = sat < 0.22
-        achromatic_dark_ratio = float(np.mean(very_dark & low_sat)) if hue.size > 0 else 0.0
-        if hue.size > 0 and achromatic_dark_ratio > 0.50:
-            return ["black"]
-
-        # NEW: If majority very bright and low-saturation, treat as pure white
-        very_bright = val > 0.96
-        achromatic_bright_ratio = float(np.mean(very_bright & low_sat)) if hue.size > 0 else 0.0
-        if hue.size > 0 and achromatic_bright_ratio > 0.50:
-            return ["white"]
         
-        # ENHANCED: Weight by saturation and value to prioritize vivid colors
+        # Weight by saturation and value
         weights = sat * val
         
         # Histogram over hue with weighted counts
@@ -354,12 +400,12 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
         order = np.argsort(hist)[::-1]
 
         def hue_to_name(hval: float) -> str:
-            """ENHANCED: More precise hue ranges"""
-            if hval < 8 or hval >= 172:  # Tighter red range
+            """More precise hue ranges"""
+            if hval < 8 or hval >= 172:
                 return "red"
-            if hval < 22:  # Tighter orange range
+            if hval < 22:
                 return "orange"
-            if hval < 38:  # Tighter yellow range
+            if hval < 38:
                 return "yellow"
             if hval < 85:
                 return "green"
@@ -379,28 +425,25 @@ def extract_dominant_colors(image: Image.Image, num_colors: int = 2) -> List[str
             center_h = (edges[idx] + edges[idx + 1]) / 2.0
             name = hue_to_name(center_h)
             
-            # ENHANCED: Avoid adding similar hues
-            hue_group = int(center_h / 20)  # Group hues into ranges
+            hue_group = int(center_h / 20)
             if hue_group in seen_hue_ranges:
                 continue
                 
-            if name not in colors and hist[idx] > hist.max() * 0.15:  # Only significant colors
+            if name not in colors and hist[idx] > hist.max() * 0.15:
                 colors.append(name)
                 seen_hue_ranges.add(hue_group)
+                print(f"  [COLOR DEBUG] Found chromatic color: {name}")
 
-        # ENHANCED: Stricter red safeguard with purity check (avoid small red accents dominating)
-        if 'red' in colors:
-            # Require red to be both saturated and not too dark (avoid near-black red)
-            red_pixels = ((hue < 8) | (hue >= 172)) & (sat > 0.38) & (val > 0.30)
-            red_ratio = float(red_pixels.sum()) / max(1, len(hue))
-            # If red clearly dominant, allow it. Otherwise, prefer achromatics when present.
-            if red_ratio > 0.45 and colors[0] != 'red':
-                colors.remove('red')
-                colors.insert(0, 'red')
-            elif red_ratio < 0.25 and 'black' in colors:
-                colors = ['black'] + [c for c in colors if c not in ('black', 'red')]
+        # If no chromatic colors detected, use brightness-based fallback
+        if not colors:
+            if avg_brightness < 0.35:
+                return ["black"]
+            elif avg_brightness > 0.75:
+                return ["white"]
+            else:
+                return ["gray"]
 
-        return colors if colors else ["multi-color"]
+        return colors
     except Exception as e:
         print(f"[WARNING] Color extraction error: {e}")
         return ["multi-color"]
@@ -528,6 +571,7 @@ def analyze_image_with_clip(image: Image.Image) -> dict:
             "women's jeans", "women's pants", "women's trousers", "women's leggings", "women's yoga pants",
             "women's jacket", "women's coat", "women's sweater", "women's hoodie", "women's cardigan",
             "women's shorts", "women's jumpsuit", "women's romper", "women's bikini",
+            "women's handbag", "women's purse", "women's heels", "women's sandals",
             
             # Men's clothing  
             "men's shirt", "men's t-shirt", "men's polo shirt", "men's formal shirt",
@@ -705,34 +749,6 @@ def calculate_color_similarity(target_colors: List[str], text: str) -> float:
     
     return match_score
 
-def is_color_match_strict(target_colors: List[str], candidate_colors: List[str]) -> bool:
-    """Strict color equality with special handling for black/white.
-    - If no target or candidate colors, return True (do not over-filter).
-    - Require target primary color to be present in candidate colors.
-    - If target is black, reject if candidate contains strong chromatic colors (e.g., red, blue, green, yellow, orange, pink, purple, cyan) besides black/gray/white.
-    - If target is white, similarly reject if candidate contains strong chromatic colors.
-    """
-    if not target_colors:
-        return True
-    if candidate_colors is None:
-        candidate_colors = []
-
-    target_primary = target_colors[0].lower()
-    candidate_set = {c.lower() for c in candidate_colors if isinstance(c, str)}
-
-    if target_primary not in candidate_set:
-        return False
-
-    strong_colors = {"red", "blue", "green", "yellow", "orange", "pink", "purple", "cyan"}
-    if target_primary == "black":
-        # Allow only achromatic companions
-        if any(c in strong_colors for c in candidate_set):
-            return False
-    if target_primary == "white":
-        if any(c in strong_colors for c in candidate_set):
-            return False
-    return True
-
 def filter_products_by_attributes(products: List[dict], target_colors: List[str], gender: str, category: str) -> List[dict]:
     """ENHANCED: Filter products with STRICT color matching"""
     if not products:
@@ -747,18 +763,11 @@ def filter_products_by_attributes(products: List[dict], target_colors: List[str]
         description = product.get('description', '').lower()
         combined_text = f"{title} {description}"
         
-        # Prefer strict image-based color check if available
-        product_colors = product.get('dominant_colors', [])
-        color_match = True
-        color_score = 1.0
-        if target_colors and target_colors != ["multi-color"]:
-            if product_colors:
-                color_match = is_color_match_strict(target_colors, product_colors)
-                color_score = 1.0 if color_match else 0.0
-            else:
-                # Fallback to text similarity
-                color_score = calculate_color_similarity(target_colors, combined_text)
-                color_match = color_score >= 0.8
+        # ENHANCED: Strict color matching with similarity scoring
+        color_score = calculate_color_similarity(target_colors, combined_text)
+        
+        # ENHANCED: Stricter threshold - require at least 80% color match
+        color_match = color_score >= 0.8
         
         if not color_match and target_colors and target_colors != ["multi-color"]:
             print(f"    [COLOR FILTER] Rejected: '{title[:50]}' (score: {color_score:.2f})")
@@ -982,8 +991,8 @@ def extract_price_from_text(text: str) -> str:
 def clean_title(title: str) -> str:
     """Clean product title"""
     noise_patterns = [
-        r'\|\s*.*$',
-        r'\-\s*.*$',
+     r'\|\s*.*',
+        r'\-\s*.*',
         r'\d{3,}x\d{3,}',
     ]
     
@@ -1095,14 +1104,6 @@ async def index_products(products: List[dict]) -> int:
                 response = await client.get(product["image_url"])
                 if response.status_code == 200:
                     embedding = extract_clip_embedding(response.content)
-
-                    # Compute image-based dominant colors for strict filtering later
-                    try:
-                        img_for_color = Image.open(io.BytesIO(response.content)).convert("RGB")
-                        dom_colors = extract_dominant_colors(img_for_color, num_colors=2)
-                        product["dominant_colors"] = dom_colors
-                    except Exception as _e:
-                        product["dominant_colors"] = []
                     
                     point = PointStruct(
                         id=str(uuid.uuid4()),
@@ -1162,6 +1163,29 @@ async def search_similar_products(image: UploadFile = File(...)):
         print("\n[ANALYZE] Analyzing image with CLIP...")
         category_info = analyze_image_with_clip(img)
         colors = extract_dominant_colors(img)
+        
+        # ENHANCED: Override color if category name contains explicit color
+        category_lower = category_info['primary_category'].lower()
+        explicit_colors = {
+            'black': ['black'],
+            'white': ['white'],
+            'red': ['red'],
+            'blue': ['blue'],
+            'green': ['green'],
+            'yellow': ['yellow'],
+            'pink': ['pink'],
+            'purple': ['purple'],
+            'orange': ['orange'],
+            'brown': ['brown'],
+            'gray': ['gray'],
+            'grey': ['gray']
+        }
+        
+        for color_keyword, color_value in explicit_colors.items():
+            if color_keyword in category_lower:
+                print(f"  [COLOR OVERRIDE] Category contains '{color_keyword}', overriding detected color {colors} -> {color_value}")
+                colors = color_value
+                break
         
         print(f"  Detected: {category_info['primary_category']}")
         print(f"  Confidence: {category_info['confidence']:.2%}")
@@ -1248,7 +1272,7 @@ async def search_similar_products(image: UploadFile = File(...)):
         elif category_info['broad_category'] == 'electronics':
             min_threshold = 0.60
         
-        # ENHANCED: Apply color-based re-scoring + strict color gate
+        # ENHANCED: Apply color-based re-scoring
         filtered_results = []
         seen_titles = set()
         
@@ -1261,17 +1285,7 @@ async def search_similar_products(image: UploadFile = File(...)):
             description = hit.payload.get('description', '')
             combined_text = f"{title} {description}".lower()
             
-            # Prefer image-based dominant colors stored in payload
-            payload_colors = hit.payload.get('dominant_colors') if isinstance(hit.payload, dict) else None
-            strict_ok = is_color_match_strict(colors, payload_colors or []) if colors and colors != ["multi-color"] else True
-            if not strict_ok and colors and colors != ["multi-color"]:
-                continue
-
-            color_match_score = 1.0 if strict_ok else calculate_color_similarity(colors, combined_text)
-            
-            # Strict color gate at result-time as well
-            if colors and colors != ["multi-color"] and color_match_score < 0.8:
-                continue
+            color_match_score = calculate_color_similarity(colors, combined_text)
             
             # ENHANCED: Boost similarity score based on color match
             adjusted_similarity = hit.score * (0.7 + 0.3 * color_match_score)
